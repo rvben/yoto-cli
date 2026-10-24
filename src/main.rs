@@ -2,33 +2,28 @@
 //!
 //! Follows The CLI Spec (clispec.dev): text on a TTY, JSON when piped,
 //! structured error envelopes on the last line of stderr, a `schema`
-//! subcommand, and mutation markers. Replace the example `run` logic with
-//! your own.
+//! subcommand, and mutation markers.
 
 use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::error::ErrorKind as ClapErrorKind;
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::json;
-use yoto_cli::{Error, OutputFormat, Request, run, schema};
+use yoto_cli::{Context, Error, LoginOptions, OutputFormat, Source, UploadOptions, schema};
 
 #[derive(Parser)]
 #[command(
     name = "yoto-cli",
     version,
     about = "Manage Yoto Make Your Own playlists from the command line: sign in, upload audio, create and inspect content.",
-    long_about = "Manage Yoto Make Your Own playlists from the command line: sign in, upload audio, create and inspect content.\n\nRun `yoto-cli schema` for the machine-readable contract (clispec.dev).",
-    args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true
+    long_about = "Manage Yoto Make Your Own playlists from the command line: sign in, upload audio, create and inspect content.\n\nAn independent tool that uses the Yoto Developer API; not made or endorsed by Yoto.\n\nRun `yoto-cli schema` for the machine-readable contract (clispec.dev)."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
-
-    /// The integer to double (the default command). Replace with your own args.
-    #[arg(value_name = "VALUE")]
-    value: Option<String>,
+    command: Command,
 
     /// Output format; auto = text on a TTY, JSON when piped.
     #[arg(long, short = 'o', value_enum, default_value = "auto", global = true)]
@@ -37,12 +32,125 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Sign in, check or forget the stored Yoto sign-in.
+    #[command(subcommand)]
+    Auth(AuthCommand),
+    /// List, inspect or delete your Make Your Own playlists.
+    #[command(subcommand)]
+    Content(ContentCommand),
+    /// Find icons to show on the player while a track plays.
+    #[command(subcommand)]
+    Icons(IconsCommand),
+    /// Create a playlist from a folder of audio files or a manifest playlist.
+    #[command(group(ArgGroup::new("source").required(true).args(["dir", "manifest"])))]
+    Upload {
+        /// Folder whose MP3/M4A files become the tracks, in file-name order.
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// A prepared manifest.json; titles, order and cover come from it.
+        #[arg(long, requires = "book")]
+        manifest: Option<PathBuf>,
+        /// Book key in the manifest.
+        #[arg(long, requires = "manifest")]
+        book: Option<String>,
+        /// Playlist name within the book, when it has more than one (e.g. "Kaart 2").
+        #[arg(long, requires = "manifest")]
+        playlist: Option<String>,
+        /// Playlist title (default: the book or folder name).
+        #[arg(long)]
+        title: Option<String>,
+        /// Cover image (JPEG or PNG) instead of the detected one.
+        #[arg(long, conflicts_with = "no_cover")]
+        cover: Option<PathBuf>,
+        /// Do not upload a cover.
+        #[arg(long)]
+        no_cover: bool,
+        /// icons.json assigning icons by track number (default: icons.json beside the audio or in the book folder).
+        #[arg(long, value_name = "FILE", conflicts_with = "no_icons")]
+        icons: Option<PathBuf>,
+        /// Icon for every track the icons.json does not name: an image file or yoto:#<mediaId>.
+        #[arg(long, value_name = "ICON")]
+        icon: Option<String>,
+        /// Ignore any icons.json.
+        #[arg(long)]
+        no_icons: bool,
+        /// Replace the content of this existing playlist instead of creating a new one.
+        #[arg(long, value_name = "CARD_ID")]
+        replace: Option<String>,
+        /// Check everything locally and print the plan; nothing is sent.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm creating the playlist.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Seconds to wait for Yoto to transcode each track.
+        #[arg(long, default_value_t = 600, value_name = "SECONDS")]
+        transcode_timeout: u64,
+    },
     /// Print the machine-readable contract (clispec.dev) as JSON.
     Schema,
     /// Generate a shell completion script.
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Sign in through the browser (OAuth with PKCE, loopback redirect).
+    Login {
+        /// Public client ID from https://dashboard.yoto.dev/ (or YOTO_CLIENT_ID; remembered after the first login).
+        #[arg(long)]
+        client_id: Option<String>,
+        /// Loopback port; http://127.0.0.1:<port>/callback must be a registered redirect URI.
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// OAuth scopes to request.
+        #[arg(long, default_value = yoto_cli::auth::DEFAULT_SCOPE)]
+        scope: String,
+        /// Print the sign-in link without opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Seconds to wait for the browser redirect.
+        #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+        timeout: u64,
+    },
+    /// Show the stored sign-in (no network request).
+    Status,
+    /// Forget the stored tokens.
+    Logout,
+}
+
+#[derive(Subcommand)]
+enum ContentCommand {
+    /// List your Make Your Own playlists.
+    List,
+    /// Show one playlist with its chapters.
+    Show {
+        /// Card ID, as shown by `content list`.
+        card_id: String,
+    },
+    /// Delete one of your playlists.
+    Delete {
+        /// Card ID, as shown by `content list`.
+        card_id: String,
+        /// Confirm the deletion.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum IconsCommand {
+    /// List Yoto's public icons (or your uploads), optionally filtered.
+    List {
+        /// Keep icons whose title or tags contain every word.
+        #[arg(long, short = 'q', value_name = "WORD", num_args = 1..)]
+        query: Vec<String>,
+        /// Your own uploaded icons instead of the public ones.
+        #[arg(long)]
+        mine: bool,
     },
 }
 
@@ -69,47 +177,120 @@ impl CliOutput {
     }
 }
 
+fn progress(line: String) {
+    eprintln!("{line}");
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => return handle_clap_error(e),
     };
+    let format = cli.output.resolve();
 
-    match &cli.command {
-        Some(Command::Schema) => {
+    let result = match cli.command {
+        Command::Schema => {
             println!("{}", schema::contract_json());
             return ExitCode::SUCCESS;
         }
-        Some(Command::Completions { shell }) => {
+        Command::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
-            clap_complete::generate(*shell, &mut cmd, name, &mut std::io::stdout());
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             return ExitCode::SUCCESS;
         }
-        None => {}
-    }
-
-    let Some(value) = cli.value.clone() else {
-        let err = Error::Usage {
-            message: "no value given (try `yoto-cli 21`)".into(),
-        };
-        emit_error(&err);
-        return ExitCode::from(err.exit_code() as u8);
+        command => Context::from_env().and_then(|ctx| dispatch(&ctx, command)),
     };
 
-    let request = Request {
-        value,
-        format: cli.output.resolve(),
-    };
-    match run(&request) {
+    match result {
         Ok(output) => {
-            let _ = writeln!(std::io::stdout(), "{output}");
+            let _ = writeln!(std::io::stdout(), "{}", output.render(format));
             ExitCode::SUCCESS
         }
         Err(err) => {
             emit_error(&err);
             ExitCode::from(err.exit_code() as u8)
         }
+    }
+}
+
+fn dispatch(ctx: &Context, command: Command) -> yoto_cli::Result<yoto_cli::Output> {
+    match command {
+        Command::Auth(AuthCommand::Login {
+            client_id,
+            port,
+            scope,
+            no_browser,
+            timeout,
+        }) => yoto_cli::auth_login(
+            ctx,
+            &LoginOptions {
+                client_id,
+                port,
+                scope,
+                open_browser: !no_browser,
+                timeout: Duration::from_secs(timeout),
+            },
+            progress,
+        ),
+        Command::Auth(AuthCommand::Status) => yoto_cli::auth_status(ctx),
+        Command::Auth(AuthCommand::Logout) => yoto_cli::auth_logout(ctx),
+        Command::Content(ContentCommand::List) => yoto_cli::content_list(ctx),
+        Command::Content(ContentCommand::Show { card_id }) => yoto_cli::content_show(ctx, &card_id),
+        Command::Content(ContentCommand::Delete { card_id, yes }) => {
+            yoto_cli::content_delete(ctx, &card_id, yes)
+        }
+        Command::Icons(IconsCommand::List { query, mine }) => {
+            yoto_cli::icons_list(ctx, mine, &query)
+        }
+        Command::Upload {
+            dir,
+            manifest,
+            book,
+            playlist,
+            title,
+            cover,
+            no_cover,
+            icons,
+            icon,
+            no_icons,
+            replace,
+            dry_run,
+            yes,
+            transcode_timeout,
+        } => {
+            let source = match (&dir, &manifest, &book) {
+                (Some(d), None, _) => Source::Dir(d),
+                (None, Some(m), Some(b)) => Source::Manifest {
+                    path: m,
+                    book: b,
+                    playlist: playlist.as_deref(),
+                },
+                _ => {
+                    return Err(Error::Usage {
+                        message: "give either DIR or --manifest with --book".into(),
+                    });
+                }
+            };
+            yoto_cli::upload(
+                ctx,
+                &UploadOptions {
+                    source,
+                    title,
+                    cover,
+                    no_cover,
+                    icons,
+                    icon,
+                    no_icons,
+                    replace,
+                    dry_run,
+                    yes,
+                    transcode_timeout: Duration::from_secs(transcode_timeout),
+                },
+                progress,
+            )
+        }
+        Command::Schema | Command::Completions { .. } => unreachable!("handled before dispatch"),
     }
 }
 
