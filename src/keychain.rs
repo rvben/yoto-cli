@@ -10,6 +10,8 @@
 //! and readable. The part names are a fixed, small set, and a logout
 //! removes all of them, so no tokens outlive it whatever stopped earlier.
 
+use std::hash::BuildHasher;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -84,26 +86,18 @@ impl Backend for Keyring {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Header {
-    generation: u64,
+    /// Which of the two slots of part entries holds the parts.
+    slot: u64,
     parts: usize,
-}
-
-impl Header {
-    fn slot(&self) -> u64 {
-        slot(self.generation)
-    }
+    /// Random per save, so no two saves write the same header and a reader
+    /// can always tell that the sign-in was replaced while it read.
+    nonce: u64,
 }
 
 /// The most parts one document is split into. With 1280 units an entry this
 /// holds ten times a Yoto sign-in, and it bounds the names a sign-in can
 /// occupy, so a logout can remove every one of them.
 const MAX_PARTS: usize = 8;
-
-/// Successive generations alternate between two slots of part entries, so a
-/// save never overwrites the parts the stored header names.
-fn slot(generation: u64) -> u64 {
-    generation % 2
-}
 
 fn part_account(slot: u64, n: usize) -> String {
     format!("{ACCOUNT}.{slot}.{n}")
@@ -149,7 +143,7 @@ pub fn load(backend: &dyn Backend) -> Result<Option<String>> {
 fn join(backend: &dyn Backend, h: &Header) -> Result<Result<String>> {
     let mut text = String::new();
     for n in 0..h.parts {
-        let Some(part) = backend.get(&part_account(h.slot(), n))? else {
+        let Some(part) = backend.get(&part_account(h.slot, n))? else {
             return Ok(Err(err(
                 "read the keychain",
                 format!("part {n} of {} of the stored sign-in is missing", h.parts),
@@ -181,18 +175,22 @@ pub fn save(backend: &dyn Backend, text: &str, limit: usize) -> Result<()> {
     }
     if parts.len() == 1 {
         backend.set(ACCOUNT, text)?;
-        clear(backend, 0, 0)?;
-        return clear(backend, 1, 0);
+        clear_stale(backend, 0, 0);
+        clear_stale(backend, 1, 0);
+        return Ok(());
     }
     let previous = backend.get(ACCOUNT)?.as_deref().and_then(header);
+    // The slot the stored header does not name, so its parts stay intact
+    // until the new header replaces it.
     let h = Header {
-        generation: previous.map_or(1, |h| h.generation + 1),
+        slot: previous.map_or(1, |h| 1 - h.slot),
         parts: parts.len(),
+        nonce: std::collections::hash_map::RandomState::new().hash_one(parts.len()),
     };
     let stored = parts
         .iter()
         .enumerate()
-        .try_for_each(|(n, part)| backend.set(&part_account(h.slot(), n), part))
+        .try_for_each(|(n, part)| backend.set(&part_account(h.slot, n), part))
         .and_then(|()| {
             backend.set(
                 ACCOUNT,
@@ -201,11 +199,19 @@ pub fn save(backend: &dyn Backend, text: &str, limit: usize) -> Result<()> {
         });
     if let Err(e) = stored {
         // Best effort: whatever stays is cleared by the next save or logout.
-        let _ = clear(backend, h.slot(), 0);
+        let _ = clear(backend, h.slot, 0);
         return Err(e);
     }
-    clear(backend, h.slot(), h.parts)?;
-    clear(backend, 1 - h.slot(), 0)
+    clear_stale(backend, h.slot, h.parts);
+    clear_stale(backend, 1 - h.slot, 0);
+    Ok(())
+}
+
+/// [`clear`] once the new sign-in is stored. A failure leaves only entries
+/// no header names, which the next save or logout removes, so it must not
+/// turn a stored sign-in into a failed save.
+fn clear_stale(backend: &dyn Backend, slot: u64, from: usize) {
+    let _ = clear(backend, slot, from);
 }
 
 /// Remove the stored document and every part entry. Returns whether there
@@ -261,6 +267,7 @@ mod tests {
     struct Memory {
         entries: RefCell<BTreeMap<String, String>>,
         fail_set: Option<&'static str>,
+        fail_delete: Option<&'static str>,
     }
 
     impl Backend for Memory {
@@ -279,6 +286,9 @@ mod tests {
         }
 
         fn delete(&self, account: &str) -> Result<bool> {
+            if self.fail_delete == Some(account) {
+                return Err(err("delete from the keychain", "denied"));
+            }
             Ok(self.entries.borrow_mut().remove(account).is_some())
         }
     }
@@ -384,7 +394,8 @@ mod tests {
     fn stopped_after_header(m: &Memory) {
         save(m, LONG, 10).unwrap();
         orphan(m, 0, 3);
-        m.set("tokens", r#"{"generation":2,"parts":3}"#).unwrap();
+        m.set("tokens", r#"{"slot":0,"parts":3,"nonce":7}"#)
+            .unwrap();
     }
 
     #[test]
@@ -495,6 +506,30 @@ mod tests {
         let third = LONG.replace("access", "ACCESS");
         let racing = Racing::new(inner, 1, &[&second, &third]);
         assert_eq!(load(&racing).unwrap().as_deref(), Some(third.as_str()));
+    }
+
+    #[test]
+    fn a_read_spanning_a_short_and_a_long_save_never_mixes_their_parts() {
+        let inner = Memory::default();
+        save(&inner, LONG, 10).unwrap();
+        // The short save stores no header, and the long one after it needs
+        // as many parts as the sign-in being read, in the same slot.
+        let long = LONG.replace("access", "ACCESS");
+        let racing = Racing::new(inner, 1, &["{}", &long]);
+        assert_eq!(load(&racing).unwrap().as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn a_stored_sign_in_is_kept_when_removing_stale_parts_fails() {
+        for text in ["{}", LONG] {
+            let m = Memory {
+                fail_delete: Some("tokens.0.5"),
+                ..Memory::default()
+            };
+            m.set("tokens.0.5", "stale").unwrap();
+            save(&m, text, 10).unwrap();
+            assert_eq!(load(&m).unwrap().as_deref(), Some(text));
+        }
     }
 
     #[test]
