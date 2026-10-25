@@ -925,6 +925,28 @@ fn a_stalled_token_refresh_cannot_hold_the_transcode_past_its_deadline() {
 }
 
 #[test]
+fn a_token_response_stalled_after_its_headers_is_a_transcode_timeout() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    let dir = poll_needs_renewal(&mut server, &env);
+    server
+        .mock("POST", "/oauth/token")
+        .with_header("content-type", "application/json")
+        .with_chunked_body(|w| {
+            w.write_all(br#"{"access_token": "#)?;
+            w.flush()?;
+            std::thread::sleep(Duration::from_secs(6));
+            w.write_all(br#""new", "refresh_token": "refresh-2", "expires_in": 86400}"#)
+        })
+        .create();
+
+    let (out, elapsed) = upload_with_one_second_transcode(&env, &dir);
+    assert_eq!(out.code, 10, "{}", out.stderr);
+    assert_eq!(out.error()["kind"], "transcode_timeout");
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+}
+
+#[test]
 fn a_held_token_lock_cannot_hold_the_transcode_past_its_deadline() {
     let mut server = Server::new();
     let env = Env::new(&server.url());

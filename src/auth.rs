@@ -229,11 +229,12 @@ fn token_request(
         let left = deadline.saturating_duration_since(Instant::now());
         rb = rb.timeout(left.max(Duration::from_millis(1)));
     }
-    let resp = rb
-        .send()
-        .map_err(|e| (0, "network".to_string(), e.to_string()))?;
+    let network = |e: reqwest::Error| (0, "network".to_string(), e.to_string());
+    let resp = rb.send().map_err(network)?;
     let status = resp.status().as_u16();
-    let text = resp.text().unwrap_or_default();
+    // A body cut off or stalled past the timeout is a transport failure,
+    // not a malformed answer.
+    let text = resp.text().map_err(network)?;
     if (200..300).contains(&status) {
         return serde_json::from_str(&text)
             .map_err(|e| (status, "invalid_response".to_string(), e.to_string()));
