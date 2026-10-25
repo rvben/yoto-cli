@@ -154,14 +154,7 @@ impl TokenStore {
 
     /// [`lock`](Self::lock), giving up once `deadline` passes.
     pub fn lock_until(&self, deadline: Option<Instant>) -> Result<fs::File> {
-        let path = match self {
-            TokenStore::Keychain => config_dir()?.join("tokens.lock"),
-            TokenStore::File(path) => {
-                let mut name = path.as_os_str().to_owned();
-                name.push(".lock");
-                PathBuf::from(name)
-            }
-        };
+        let path = self.lock_path()?;
         let err = |e: std::io::Error| store_err(&format!("lock {}", path.display()), e);
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(err)?;
@@ -196,6 +189,26 @@ impl TokenStore {
                 Err(fs::TryLockError::Error(e)) => return Err(err(e)),
             }
         }
+    }
+
+    /// The keychain holds one sign-in per OS user whatever
+    /// `YOTO_CLI_CONFIG_DIR` says, so its lock sits in the user's own config
+    /// directory and not in the overridable one.
+    fn lock_path(&self) -> Result<PathBuf> {
+        Ok(match self {
+            TokenStore::Keychain => dirs::config_dir()
+                .ok_or_else(|| Error::TokenStore {
+                    message: "cannot determine the user config directory for the keychain lock"
+                        .into(),
+                })?
+                .join("yoto-cli")
+                .join("tokens.lock"),
+            TokenStore::File(path) => {
+                let mut name = path.as_os_str().to_owned();
+                name.push(".lock");
+                PathBuf::from(name)
+            }
+        })
     }
 
     /// Remove the stored sign-in. Returns whether there was one.
@@ -267,6 +280,16 @@ mod tests {
         write_private(&path, b"{}").unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn the_keychain_lock_is_shared_whatever_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs every test in a process of its own.
+        unsafe { std::env::set_var("YOTO_CLI_CONFIG_DIR", dir.path()) };
+        let path = TokenStore::Keychain.lock_path().unwrap();
+        assert!(!path.starts_with(dir.path()), "{}", path.display());
+        assert!(path.ends_with("yoto-cli/tokens.lock"), "{}", path.display());
     }
 
     #[test]
