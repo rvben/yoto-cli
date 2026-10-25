@@ -10,7 +10,7 @@
 //! the token still finishes. A 401 means the request was not processed, so
 //! resending it after the renewal is safe even for creating content.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -30,9 +30,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Where a signed-in client gets access tokens.
 pub trait Credentials {
     /// Tokens valid for at least the safety margin, refreshed when needed.
-    fn current(&self) -> Result<Tokens>;
+    /// Gives up once `deadline` passes.
+    fn current(&self, deadline: Option<Instant>) -> Result<Tokens>;
     /// Tokens other than `rejected`, which looked valid but the API refused.
-    fn renew(&self, rejected: &Tokens) -> Result<Tokens>;
+    /// Gives up once `deadline` passes.
+    fn renew(&self, rejected: &Tokens, deadline: Option<Instant>) -> Result<Tokens>;
 }
 
 /// How a request may be repeated.
@@ -72,6 +74,9 @@ pub struct Client {
     tokens: RefCell<Tokens>,
     /// `None` for a fixed token that is never renewed.
     credentials: Option<Box<dyn Credentials>>,
+    /// While set, renewing the sign-in gives up at this instant: a poll
+    /// bounded by a deadline must not be held past it by the renewal.
+    deadline: Cell<Option<Instant>>,
     /// Overridable so tests do not sleep.
     pub poll_interval: Duration,
     pub retry_base: Duration,
@@ -110,7 +115,7 @@ impl Client {
     /// A client that takes its tokens from `credentials` and renews them as
     /// they run out.
     pub fn signed_in(http: Http, base: &str, credentials: Box<dyn Credentials>) -> Result<Self> {
-        let tokens = credentials.current()?;
+        let tokens = credentials.current(None)?;
         Ok(Client::build(http, base, tokens, Some(credentials)))
     }
 
@@ -125,6 +130,7 @@ impl Client {
             base: base.trim_end_matches('/').to_string(),
             tokens: RefCell::new(tokens),
             credentials,
+            deadline: Cell::new(None),
             poll_interval: Duration::from_secs(2),
             retry_base: Duration::from_secs(1),
         }
@@ -139,7 +145,7 @@ impl Client {
         if let Some(credentials) = &self.credentials
             && !is_fresh(&self.tokens.borrow(), now_unix())
         {
-            let fresh = credentials.current()?;
+            let fresh = credentials.current(self.deadline.get())?;
             *self.tokens.borrow_mut() = fresh;
         }
         Ok(rb
@@ -165,7 +171,7 @@ impl Client {
                 && policy.renew_on_401
                 && !renewed
             {
-                let fresh = credentials.renew(&self.tokens.borrow())?;
+                let fresh = credentials.renew(&self.tokens.borrow(), self.deadline.get())?;
                 *self.tokens.borrow_mut() = fresh;
                 renewed = true;
                 continue;
@@ -322,8 +328,20 @@ impl Client {
     /// request and each wait is cut to the time left, so the deadline holds
     /// however slow the API is.
     pub fn wait_transcoded(&self, upload_id: &str, timeout: Duration) -> Result<Transcoded> {
-        let path = format!("/media/upload/{}/transcoded", encode_segment(upload_id));
         let deadline = Instant::now() + timeout;
+        self.deadline.set(Some(deadline));
+        let result = self.poll_transcoded(upload_id, timeout, deadline);
+        self.deadline.set(None);
+        result
+    }
+
+    fn poll_transcoded(
+        &self,
+        upload_id: &str,
+        timeout: Duration,
+        deadline: Instant,
+    ) -> Result<Transcoded> {
+        let path = format!("/media/upload/{}/transcoded", encode_segment(upload_id));
         let mut last_failure: Option<String> = None;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -340,8 +358,9 @@ impl Client {
             }
             // The budget is taken when the request is built, so a token
             // renewal before it (or before a retry after a 401) is paid for
-            // out of the same deadline.
-            let result = self.exchange(
+            // out of the same deadline. A renewal that ran out of time is a
+            // check that did not answer; any other renewal failure is final.
+            let result = match self.exchange(
                 || {
                     let rb = self
                         .authed(self.http.get(self.url(&path)))?
@@ -350,7 +369,16 @@ impl Client {
                     Ok(rb.timeout(left.max(Duration::from_millis(1)).min(REQUEST_TIMEOUT)))
                 },
                 ONCE,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(e @ (Error::Network { .. } | Error::TokenStore { .. }))
+                    if Instant::now() >= deadline =>
+                {
+                    last_failure = Some(e.to_string());
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let mut wait = self.poll_interval;
             let transport = |e: reqwest::Error| {
                 if e.is_timeout() || e.is_connect() {
@@ -608,7 +636,7 @@ mod tests {
     }
 
     impl Credentials for Expiring {
-        fn current(&self) -> Result<Tokens> {
+        fn current(&self, _: Option<Instant>) -> Result<Tokens> {
             let n = self.calls.get();
             self.calls.set(n + 1);
             let (token, expires_at) = if n == 0 {
@@ -625,7 +653,7 @@ mod tests {
             })
         }
 
-        fn renew(&self, _: &Tokens) -> Result<Tokens> {
+        fn renew(&self, _: &Tokens, _: Option<Instant>) -> Result<Tokens> {
             panic!("an expiring token must be renewed before it is sent, not after a 401")
         }
     }
@@ -759,7 +787,7 @@ mod tests {
     struct SlowRenewal;
 
     impl Credentials for SlowRenewal {
-        fn current(&self) -> Result<Tokens> {
+        fn current(&self, _: Option<Instant>) -> Result<Tokens> {
             Ok(Tokens {
                 client_id: "c".into(),
                 access_token: "old".into(),
@@ -769,11 +797,11 @@ mod tests {
             })
         }
 
-        fn renew(&self, _: &Tokens) -> Result<Tokens> {
+        fn renew(&self, _: &Tokens, _: Option<Instant>) -> Result<Tokens> {
             std::thread::sleep(Duration::from_millis(900));
             Ok(Tokens {
                 access_token: "new".into(),
-                ..self.current()?
+                ..self.current(None)?
             })
         }
     }

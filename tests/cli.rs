@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use mockito::{Matcher, Server};
 use serde_json::{Value, json};
@@ -861,6 +862,94 @@ fn token_rejected_mid_upload_is_renewed_and_the_run_finishes() {
         serde_json::from_str(&std::fs::read_to_string(env.token_file()).unwrap()).unwrap();
     assert_eq!(stored["access_token"], "new");
     assert_eq!(stored["refresh_token"], "refresh-2");
+}
+
+/// A book whose first poll is refused with a 401, so the run has to renew
+/// the sign-in while it waits for the transcode.
+fn poll_needs_renewal(server: &mut Server, env: &Env) -> PathBuf {
+    env.sign_in("old", far_future(), Some("refresh-1"));
+    let dir = book(env.tmp.path());
+    server
+        .mock("GET", "/media/transcode/audio/uploadUrl")
+        .match_query(Matcher::Any)
+        .with_body(json!({"upload": {"uploadId": "up1", "uploadUrl": null}}).to_string())
+        .create();
+    server
+        .mock("GET", "/media/upload/up1/transcoded")
+        .match_query(Matcher::Any)
+        .match_header("authorization", "Bearer old")
+        .with_status(401)
+        .create();
+    server
+        .mock("GET", "/media/upload/up1/transcoded")
+        .match_query(Matcher::Any)
+        .match_header("authorization", "Bearer new")
+        .with_status(404)
+        .create();
+    dir
+}
+
+fn upload_with_one_second_transcode(env: &Env, dir: &Path) -> (Output, Duration) {
+    let started = Instant::now();
+    let out = env.run(&[
+        "upload",
+        "--yes",
+        "--no-cover",
+        "--no-icons",
+        "--transcode-timeout",
+        "1",
+        dir.to_str().unwrap(),
+    ]);
+    (out, started.elapsed())
+}
+
+#[test]
+fn a_stalled_token_refresh_cannot_hold_the_transcode_past_its_deadline() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    let dir = poll_needs_renewal(&mut server, &env);
+    server
+        .mock("POST", "/oauth/token")
+        .with_body_from_request(|_| {
+            std::thread::sleep(Duration::from_secs(6));
+            json!({"access_token": "new", "refresh_token": "refresh-2", "expires_in": 86400})
+                .to_string()
+                .into()
+        })
+        .create();
+
+    let (out, elapsed) = upload_with_one_second_transcode(&env, &dir);
+    assert_eq!(out.code, 10, "{}", out.stderr);
+    assert_eq!(out.error()["kind"], "transcode_timeout");
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+}
+
+#[test]
+fn a_held_token_lock_cannot_hold_the_transcode_past_its_deadline() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    let dir = poll_needs_renewal(&mut server, &env);
+    let _rotation = mock_rotation(&mut server);
+    // Another yoto-cli process is refreshing and keeps the lock for 6 s.
+    let mut lock_path = env.token_file().into_os_string();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock.lock().unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(6));
+        drop(lock);
+    });
+
+    let (out, elapsed) = upload_with_one_second_transcode(&env, &dir);
+    holder.join().unwrap();
+    assert_eq!(out.code, 10, "{}", out.stderr);
+    assert_eq!(out.error()["kind"], "transcode_timeout");
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
 }
 
 #[test]

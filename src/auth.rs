@@ -221,11 +221,15 @@ fn token_request(
     http: &reqwest::blocking::Client,
     endpoints: &Endpoints,
     form: &[(&str, &str)],
+    deadline: Option<Instant>,
 ) -> std::result::Result<TokenResponse, (u16, String, String)> {
     let url = format!("{}/oauth/token", endpoints.auth);
-    let resp = http
-        .post(url)
-        .form(form)
+    let mut rb = http.post(url).form(form);
+    if let Some(deadline) = deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        rb = rb.timeout(left.max(Duration::from_millis(1)));
+    }
+    let resp = rb
         .send()
         .map_err(|e| (0, "network".to_string(), e.to_string()))?;
     let status = resp.status().as_u16();
@@ -269,7 +273,7 @@ pub fn exchange_code(
         ("code", code),
         ("redirect_uri", redirect_uri),
     ];
-    match token_request(http, endpoints, &form) {
+    match token_request(http, endpoints, &form, None) {
         Ok(resp) => Ok(tokens_from(resp, client_id, None)),
         Err((0, _, msg)) => Err(Error::Network {
             message: format!("token exchange failed: {msg}"),
@@ -282,12 +286,14 @@ pub fn exchange_code(
     }
 }
 
-/// Exchange the refresh token for new tokens. The caller must persist the
-/// result immediately: the old refresh token is now spent.
+/// Exchange the refresh token for new tokens, giving up once `deadline`
+/// passes. The caller must persist the result immediately: the old refresh
+/// token is now spent.
 pub fn refresh(
     http: &reqwest::blocking::Client,
     endpoints: &Endpoints,
     tokens: &Tokens,
+    deadline: Option<Instant>,
 ) -> Result<Tokens> {
     let Some(refresh_token) = tokens.refresh_token.as_deref() else {
         return Err(Error::NotAuthenticated {
@@ -299,7 +305,7 @@ pub fn refresh(
         ("client_id", tokens.client_id.as_str()),
         ("refresh_token", refresh_token),
     ];
-    match token_request(http, endpoints, &form) {
+    match token_request(http, endpoints, &form, deadline) {
         Ok(resp) => {
             // A server that does not rotate refresh tokens omits the new one;
             // the current one then stays valid and must be kept.
@@ -354,30 +360,38 @@ impl StoredCredentials {
     }
 
     /// Under the lock: the stored tokens if `usable` accepts them, else a
-    /// refresh of them.
-    fn refresh_unless(&self, usable: impl Fn(&Tokens) -> bool) -> Result<Tokens> {
-        let _lock = self.store.lock()?;
+    /// refresh of them. Waiting for the lock and the refresh both stop at
+    /// `deadline`.
+    fn refresh_unless(
+        &self,
+        usable: impl Fn(&Tokens) -> bool,
+        deadline: Option<Instant>,
+    ) -> Result<Tokens> {
+        let _lock = self.store.lock_until(deadline)?;
         let tokens = self.load()?;
         if usable(&tokens) {
             return Ok(tokens);
         }
-        let fresh = refresh(&self.http, &self.endpoints, &tokens)?;
+        let fresh = refresh(&self.http, &self.endpoints, &tokens, deadline)?;
         self.store.save(&fresh)?;
         Ok(fresh)
     }
 }
 
 impl crate::api::Credentials for StoredCredentials {
-    fn current(&self) -> Result<Tokens> {
+    fn current(&self, deadline: Option<Instant>) -> Result<Tokens> {
         let tokens = self.load()?;
         if is_fresh(&tokens, now_unix()) {
             return Ok(tokens);
         }
-        self.refresh_unless(|t| is_fresh(t, now_unix()))
+        self.refresh_unless(|t| is_fresh(t, now_unix()), deadline)
     }
 
-    fn renew(&self, rejected: &Tokens) -> Result<Tokens> {
-        self.refresh_unless(|t| t.access_token != rejected.access_token && is_fresh(t, now_unix()))
+    fn renew(&self, rejected: &Tokens, deadline: Option<Instant>) -> Result<Tokens> {
+        self.refresh_unless(
+            |t| t.access_token != rejected.access_token && is_fresh(t, now_unix()),
+            deadline,
+        )
     }
 }
 

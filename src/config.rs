@@ -7,6 +7,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -150,6 +151,11 @@ impl TokenStore {
     /// store, until the returned file is dropped. Refreshing spends the
     /// single-use refresh token, so only one process may do it at a time.
     pub fn lock(&self) -> Result<fs::File> {
+        self.lock_until(None)
+    }
+
+    /// [`lock`](Self::lock), giving up once `deadline` passes.
+    pub fn lock_until(&self, deadline: Option<Instant>) -> Result<fs::File> {
         let path = match self {
             TokenStore::Keychain => config_dir()?.join("tokens.lock"),
             TokenStore::File(path) => {
@@ -170,8 +176,28 @@ impl TokenStore {
             options.mode(0o600);
         }
         let file = options.open(&path).map_err(err)?;
-        file.lock().map_err(err)?;
-        Ok(file)
+        let Some(deadline) = deadline else {
+            file.lock().map_err(err)?;
+            return Ok(file);
+        };
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(fs::TryLockError::WouldBlock) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(Error::TokenStore {
+                            message: format!(
+                                "timed out waiting for {}: another yoto-cli process is renewing the sign-in",
+                                path.display()
+                            ),
+                        });
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(25)));
+                }
+                Err(fs::TryLockError::Error(e)) => return Err(err(e)),
+            }
+        }
     }
 
     /// Remove the stored sign-in. Returns whether there was one.
