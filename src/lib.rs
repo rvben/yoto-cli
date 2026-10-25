@@ -12,6 +12,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod icons;
+pub mod keychain;
 pub mod plan;
 pub mod schema;
 pub mod upload;

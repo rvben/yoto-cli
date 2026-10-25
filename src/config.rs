@@ -12,13 +12,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::keychain;
 
 pub const DEFAULT_API_URL: &str = "https://api.yotoplay.com";
 pub const DEFAULT_AUTH_URL: &str = "https://login.yotoplay.com";
 /// The OAuth audience Yoto issues API tokens for.
 pub const AUDIENCE: &str = "https://api.yotoplay.com";
-const KEYCHAIN_SERVICE: &str = "yoto-cli";
-const KEYCHAIN_ACCOUNT: &str = "tokens";
 
 /// Base URLs, overridable so tests can point at a local mock server.
 #[derive(Debug, Clone)]
@@ -121,10 +120,9 @@ impl TokenStore {
 
     pub fn load(&self) -> Result<Option<Tokens>> {
         let text = match self {
-            TokenStore::Keychain => match keychain_entry()?.get_password() {
-                Ok(t) => t,
-                Err(keyring::Error::NoEntry) => return Ok(None),
-                Err(e) => return Err(store_err("read the keychain", e)),
+            TokenStore::Keychain => match keychain::load(&keychain::Keyring::default())? {
+                Some(t) => t,
+                None => return Ok(None),
             },
             TokenStore::File(path) => match fs::read_to_string(path) {
                 Ok(t) => t,
@@ -140,9 +138,9 @@ impl TokenStore {
     pub fn save(&self, tokens: &Tokens) -> Result<()> {
         let text = serde_json::to_string(tokens).expect("tokens serialize");
         match self {
-            TokenStore::Keychain => keychain_entry()?
-                .set_password(&text)
-                .map_err(|e| store_err("write the keychain", e)),
+            TokenStore::Keychain => {
+                keychain::save(&keychain::Keyring::default(), &text, keychain::ENTRY_LIMIT)
+            }
             TokenStore::File(path) => write_private(path, text.as_bytes()),
         }
     }
@@ -203,11 +201,7 @@ impl TokenStore {
     /// Remove the stored sign-in. Returns whether there was one.
     pub fn delete(&self) -> Result<bool> {
         match self {
-            TokenStore::Keychain => match keychain_entry()?.delete_credential() {
-                Ok(()) => Ok(true),
-                Err(keyring::Error::NoEntry) => Ok(false),
-                Err(e) => Err(store_err("delete from the keychain", e)),
-            },
+            TokenStore::Keychain => keychain::delete(&keychain::Keyring::default()),
             TokenStore::File(path) => match fs::remove_file(path) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -215,11 +209,6 @@ impl TokenStore {
             },
         }
     }
-}
-
-fn keychain_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-        .map_err(|e| store_err("open the keychain", e))
 }
 
 fn store_err(what: &str, e: impl std::fmt::Display) -> Error {
