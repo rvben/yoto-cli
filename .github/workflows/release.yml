@@ -69,6 +69,8 @@ jobs:
           - os: macos-14
             target: x86_64-apple-darwin
             cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -102,12 +104,20 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           ARCHIVE_NAME="yoto-cli-${VERSION}-${{ matrix.target }}"
           mkdir -p release-package
-          cp "target/${{ matrix.target }}/release/yoto-cli" release-package/yoto-cli
-          tar -czf "${ARCHIVE_NAME}.tar.gz" -C release-package yoto-cli
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
-            shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            # Windows users expect a zip holding the .exe.
+            ARCHIVE="${ARCHIVE_NAME}.zip"
+            cp "target/${{ matrix.target }}/release/yoto-cli.exe" release-package/yoto-cli.exe
+            (cd release-package && 7z a "../${ARCHIVE}" yoto-cli.exe)
           else
-            sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+            ARCHIVE="${ARCHIVE_NAME}.tar.gz"
+            cp "target/${{ matrix.target }}/release/yoto-cli" release-package/yoto-cli
+            tar -czf "${ARCHIVE}" -C release-package yoto-cli
+          fi
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          else
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
           fi
           rm -rf release-package
 
@@ -123,6 +133,7 @@ jobs:
           name: release-${{ matrix.target }}
           path: |
             yoto-cli-*-${{ matrix.target }}.tar.gz*
+            yoto-cli-*-${{ matrix.target }}.zip*
 
   sdist:
     name: Build source distribution
@@ -200,6 +211,8 @@ jobs:
           files: |
             artifacts/release-*/yoto-cli-*.tar.gz
             artifacts/release-*/yoto-cli-*.tar.gz.sha256
+            artifacts/release-*/yoto-cli-*.zip
+            artifacts/release-*/yoto-cli-*.zip.sha256
 
   update-homebrew:
     name: Update Homebrew tap
