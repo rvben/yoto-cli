@@ -7,7 +7,9 @@
 //! `tokens.<generation>.<n>`, and `tokens` then holds only a header naming
 //! them. The parts are written before the header and the previous
 //! generation's parts are removed after it, so an interrupted save leaves
-//! the previous sign-in complete and readable.
+//! the previous sign-in complete and readable. The parts such a save leaves
+//! behind sit in the one generation the next save writes to, which every
+//! save and every logout sweeps, so no tokens outlive a logout.
 
 use serde::{Deserialize, Serialize};
 
@@ -145,49 +147,79 @@ fn join(backend: &dyn Backend, h: &Header) -> Result<std::result::Result<String,
     Ok(Ok(text))
 }
 
+/// The generation a save writes its parts to: one past the stored header's,
+/// or 1 without one. A save that never got to write its header leaves its
+/// parts here, so this is the one place to look for them.
+fn next_generation(h: Option<&Header>) -> u64 {
+    h.map_or(1, |h| h.generation + 1)
+}
+
 /// Store `text`, split into entries of at most `limit` UTF-16 code units.
 pub fn save(backend: &dyn Backend, text: &str, limit: usize) -> Result<()> {
     let previous = backend.get(ACCOUNT)?.as_deref().and_then(header);
+    let generation = next_generation(previous.as_ref());
     let parts = split(text, limit);
-    if parts.len() == 1 {
+    let written = if parts.len() == 1 {
         backend.set(ACCOUNT, text)?;
+        0
     } else {
-        let generation = previous.as_ref().map_or(1, |h| h.generation + 1);
-        for (n, part) in parts.iter().enumerate() {
-            backend.set(&part_account(generation, n), part)?;
-        }
         let h = Header {
             generation,
             parts: parts.len(),
         };
-        backend.set(
-            ACCOUNT,
-            &serde_json::to_string(&h).expect("header serializes"),
-        )?;
-    }
+        let stored = parts
+            .iter()
+            .enumerate()
+            .try_for_each(|(n, part)| backend.set(&part_account(generation, n), part))
+            .and_then(|()| {
+                backend.set(
+                    ACCOUNT,
+                    &serde_json::to_string(&h).expect("header serializes"),
+                )
+            });
+        if let Err(e) = stored {
+            // Best effort: what is left is swept by the next save or logout.
+            let _ = remove_parts(backend, generation, 0, 0);
+            return Err(e);
+        }
+        h.parts
+    };
+    // Parts beyond the ones just written are left from an interrupted save.
+    remove_parts(backend, generation, written, 0)?;
     if let Some(old) = previous {
-        remove_parts(backend, &old)?;
+        remove_parts(backend, old.generation, 0, old.parts)?;
     }
     Ok(())
 }
 
-/// Remove the stored document and its parts. Returns whether there was one.
+/// Remove the stored document and its parts, including any left by an
+/// interrupted save. Returns whether there was a document.
 pub fn delete(backend: &dyn Backend) -> Result<bool> {
-    let Some(stored) = backend.get(ACCOUNT)? else {
-        return Ok(false);
-    };
+    let stored = backend.get(ACCOUNT)?;
+    let h = stored.as_deref().and_then(header);
     // The header goes first: without it nothing reads the parts, so a
     // delete cut short still leaves the user signed out.
-    backend.delete(ACCOUNT)?;
-    if let Some(h) = header(&stored) {
-        remove_parts(backend, &h)?;
+    if stored.is_some() {
+        backend.delete(ACCOUNT)?;
     }
-    Ok(true)
+    if let Some(h) = &h {
+        remove_parts(backend, h.generation, 0, h.parts)?;
+    }
+    remove_parts(backend, next_generation(h.as_ref()), 0, 0)?;
+    Ok(stored.is_some())
 }
 
-fn remove_parts(backend: &dyn Backend, h: &Header) -> Result<()> {
-    for n in 0..h.parts {
-        backend.delete(&part_account(h.generation, n))?;
+/// Remove the parts of `generation` from part `from` on: every one below
+/// `at_least`, and past that each next one for as long as it exists.
+fn remove_parts(
+    backend: &dyn Backend,
+    generation: u64,
+    from: usize,
+    at_least: usize,
+) -> Result<()> {
+    let mut n = from;
+    while backend.delete(&part_account(generation, n))? || n < at_least {
+        n += 1;
     }
     Ok(())
 }
@@ -312,6 +344,57 @@ mod tests {
         let newer = LONG.replace("r-123", "r-456");
         assert!(save(&m, &newer, 10).is_err());
         assert_eq!(load(&m).unwrap().as_deref(), Some(LONG));
+    }
+
+    #[test]
+    fn a_failed_header_write_leaves_no_parts_behind() {
+        let m = Memory {
+            fail_set: Some("tokens"),
+            ..Memory::default()
+        };
+        assert!(save(&m, LONG, 10).is_err());
+        assert!(m.accounts().is_empty(), "{:?}", m.accounts());
+    }
+
+    /// Parts of generation `generation` as a save killed before writing
+    /// its header leaves them: complete, but named by no header.
+    fn orphan(m: &Memory, generation: u64, parts: usize) {
+        for n in 0..parts {
+            m.set(&part_account(generation, n), "secret").unwrap();
+        }
+    }
+
+    #[test]
+    fn logout_removes_parts_left_by_an_interrupted_save() {
+        let m = Memory::default();
+        orphan(&m, 1, 3);
+        assert!(!delete(&m).unwrap());
+        assert!(m.accounts().is_empty(), "{:?}", m.accounts());
+
+        save(&m, LONG, 10).unwrap();
+        orphan(&m, 2, 3);
+        assert!(delete(&m).unwrap());
+        assert!(m.accounts().is_empty(), "{:?}", m.accounts());
+
+        m.set("tokens", "{}").unwrap();
+        orphan(&m, 1, 3);
+        assert!(delete(&m).unwrap());
+        assert!(m.accounts().is_empty(), "{:?}", m.accounts());
+    }
+
+    #[test]
+    fn a_save_after_an_interrupted_one_removes_its_leftover_parts() {
+        let m = Memory::default();
+        save(&m, LONG, 10).unwrap();
+        // The interrupted save wrote more parts than the next one needs.
+        orphan(&m, 2, 20);
+        save(&m, "0123456789abc", 10).unwrap();
+        assert_eq!(m.accounts(), ["tokens", "tokens.2.0", "tokens.2.1"]);
+        assert_eq!(load(&m).unwrap().as_deref(), Some("0123456789abc"));
+
+        orphan(&m, 3, 20);
+        save(&m, "{}", 10).unwrap();
+        assert_eq!(m.accounts(), ["tokens"]);
     }
 
     /// A keychain where another process saves `newer` right after this one
