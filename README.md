@@ -14,8 +14,13 @@ yoto-cli is an independent tool built on the public
 ## Install
 
 ```sh
+brew install rvben/tap/yoto-cli   # macOS, Linux
+uv tool install yoto-cli          # or: pipx install yoto-cli
 cargo install yoto-cli
 ```
+
+Prebuilt binaries for macOS, Linux and Windows, each with a SHA-256 checksum,
+are attached to every [GitHub release](https://github.com/rvben/yoto-cli/releases).
 
 ## Sign in
 
