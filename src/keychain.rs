@@ -95,27 +95,54 @@ fn header(stored: &str) -> Option<Header> {
     serde_json::from_str(stored).ok()
 }
 
+/// How often [`load`] starts over because another process saved a newer
+/// sign-in while it was reading the parts.
+const LOAD_ATTEMPTS: usize = 5;
+
 /// The stored document, joined from its parts when it was split.
+///
+/// Readers take no lock, so a save in another process can remove the parts
+/// of the generation being read. A missing part under a header that has
+/// since changed means exactly that, and the read starts over.
 pub fn load(backend: &dyn Backend) -> Result<Option<String>> {
-    let Some(stored) = backend.get(ACCOUNT)? else {
-        return Ok(None);
-    };
-    let Some(h) = header(&stored) else {
-        return Ok(Some(stored));
-    };
+    let mut stored = backend.get(ACCOUNT)?;
+    for _ in 0..LOAD_ATTEMPTS {
+        let Some(current) = stored else {
+            return Ok(None);
+        };
+        let Some(h) = header(&current) else {
+            return Ok(Some(current));
+        };
+        match join(backend, &h)? {
+            Ok(text) => return Ok(Some(text)),
+            Err(missing) => {
+                let latest = backend.get(ACCOUNT)?;
+                if latest.as_deref() == Some(current.as_str()) {
+                    return Err(missing);
+                }
+                stored = latest;
+            }
+        }
+    }
+    Err(err(
+        "read the keychain",
+        "the stored sign-in kept changing while it was read",
+    ))
+}
+
+/// The parts named by `h` joined, or the error for the first missing one.
+fn join(backend: &dyn Backend, h: &Header) -> Result<std::result::Result<String, Error>> {
     let mut text = String::new();
     for n in 0..h.parts {
-        let part = backend
-            .get(&part_account(h.generation, n))?
-            .ok_or_else(|| {
-                err(
-                    "read the keychain",
-                    format!("part {n} of {} of the stored sign-in is missing", h.parts),
-                )
-            })?;
+        let Some(part) = backend.get(&part_account(h.generation, n))? else {
+            return Ok(Err(err(
+                "read the keychain",
+                format!("part {n} of {} of the stored sign-in is missing", h.parts),
+            )));
+        };
         text.push_str(&part);
     }
-    Ok(Some(text))
+    Ok(Ok(text))
 }
 
 /// Store `text`, split into entries of at most `limit` UTF-16 code units.
@@ -285,6 +312,53 @@ mod tests {
         let newer = LONG.replace("r-123", "r-456");
         assert!(save(&m, &newer, 10).is_err());
         assert_eq!(load(&m).unwrap().as_deref(), Some(LONG));
+    }
+
+    /// A keychain where another process saves `newer` right after this one
+    /// reads the header, before it reads the first part.
+    struct Racing {
+        inner: Memory,
+        newer: RefCell<Option<String>>,
+    }
+
+    impl Backend for Racing {
+        fn get(&self, account: &str) -> Result<Option<String>> {
+            if account != ACCOUNT
+                && let Some(newer) = self.newer.borrow_mut().take()
+            {
+                save(&self.inner, &newer, 10)?;
+            }
+            self.inner.get(account)
+        }
+
+        fn set(&self, account: &str, secret: &str) -> Result<()> {
+            self.inner.set(account, secret)
+        }
+
+        fn delete(&self, account: &str) -> Result<bool> {
+            self.inner.delete(account)
+        }
+    }
+
+    #[test]
+    fn a_read_during_a_concurrent_save_returns_the_newer_sign_in() {
+        let inner = Memory::default();
+        save(&inner, LONG, 10).unwrap();
+        let newer = LONG.replace("r-123", "r-456");
+        let racing = Racing {
+            inner,
+            newer: RefCell::new(Some(newer.clone())),
+        };
+        assert_eq!(load(&racing).unwrap().as_deref(), Some(newer.as_str()));
+    }
+
+    #[test]
+    fn a_missing_part_under_an_unchanged_header_is_an_error() {
+        let m = Memory::default();
+        save(&m, LONG, 10).unwrap();
+        m.delete(&part_account(1, 1)).unwrap();
+        let e = load(&m).unwrap_err().to_string();
+        assert!(e.contains("part 1 of"), "{e}");
     }
 
     #[test]
