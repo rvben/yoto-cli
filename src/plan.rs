@@ -17,6 +17,19 @@ pub const MAX_TRACKS: usize = 100;
 pub const MAX_TRACK_BYTES: u64 = 100_000_000;
 pub const MAX_TRACK_SECONDS: f64 = 3600.0;
 pub const MAX_PLAYLIST_BYTES: u64 = 500_000_000;
+
+/// The playlist size limit, checked again on the sizes Yoto reports after
+/// transcoding, which can exceed the source files' sizes.
+pub fn check_transcoded_bytes(bytes: u64) -> Result<()> {
+    if bytes > MAX_PLAYLIST_BYTES {
+        return Err(Error::LimitExceeded {
+            message: format!(
+                "once transcoded the playlist would hold {bytes} bytes, above Yoto's limit of {MAX_PLAYLIST_BYTES}; nothing was saved"
+            ),
+        });
+    }
+    Ok(())
+}
 pub const MAX_TITLE_CHARS: usize = 140;
 
 const AUDIO_EXTENSIONS: &[&str] = &[

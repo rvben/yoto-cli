@@ -118,6 +118,12 @@ pub fn run(
         })
         .collect();
     let mut body = content_body(&plan.title, &chapters, cover_url.as_deref(), &opts.metadata)?;
+    if let Some(bytes) = body
+        .pointer("/metadata/media/fileSize")
+        .and_then(Value::as_u64)
+    {
+        plan::check_transcoded_bytes(bytes)?;
+    }
     match &opts.replace {
         Some(id) => {
             body["cardId"] = json!(id);
