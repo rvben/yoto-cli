@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0](https://github.com/rvben/yoto-cli/compare/v0.1.1...v0.2.0) - 2026-10-26
+
+### Added
+
+- **metadata**: accept several authors and narrators ([1cb765e](https://github.com/rvben/yoto-cli/commit/1cb765ea55f1afe4b1f958237ad0a8763763aacd))
+- **content**: edit playlists in place ([36cfd6c](https://github.com/rvben/yoto-cli/commit/36cfd6c902afe8a83e730678b16ed415850aebdb))
+- **upload**: accept more formats, chapters of several tracks and metadata ([6df9834](https://github.com/rvben/yoto-cli/commit/6df9834461ad6fc5b2318b39c4f5e918f9445fb8))
+
+### Fixed
+
+- **upload**: say 1 track and 1 chapter in the summaries ([c939405](https://github.com/rvben/yoto-cli/commit/c939405026cf34f7a6ddef0d794053237be0d580))
+- **upload**: stop waiting when Yoto reports a failed transcode ([deb2fd6](https://github.com/rvben/yoto-cli/commit/deb2fd6e4708a71975a6fbf90065a35e60cdf8af))
+- **upload**: order files by number value and find cover and icons in any case ([6fec4eb](https://github.com/rvben/yoto-cli/commit/6fec4ebbfafa2d763d0a5eeacbb77bc7b1f2c43e))
+- **upload**: check the playlist size again after transcoding ([14bfeb1](https://github.com/rvben/yoto-cli/commit/14bfeb1159863e20b80a5549b5be27081d48749d))
+
 ## [0.1.1](https://github.com/rvben/yoto-cli/compare/v0.1.0...v0.1.1) - 2026-10-25
 
 ### Added
