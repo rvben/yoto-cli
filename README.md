@@ -50,7 +50,9 @@ refreshed automatically, also in the middle of a long upload;
 
 Point `upload` at a folder of audio files: MP3, M4A/AAC, WAV, FLAC,
 Ogg (Opus or Vorbis) or AIFF, recognised by their content rather than their
-extension. Tracks are taken in file-name order and a numeric prefix such as `01 - ` is dropped from the title. A
+extension. Tracks are taken in file-name order and a numeric prefix such as
+`01 - ` is dropped from the title. Each subfolder becomes one chapter of the
+audio in it; folders nested deeper are listed as ignored in the dry run. A
 `cover.jpg` or `cover.png` in the folder (or its parent) becomes the cover;
 `--cover FILE` picks another and `--no-cover` sends none. The title defaults to
 the folder name (`--title` overrides it).
@@ -146,6 +148,28 @@ lullaby:
  "sha256": "...", "chapter": "Welterusten", "on_end": "repeat"}
 ```
 
+## Edit a playlist
+
+Edits fetch the playlist, change it and save it under the same card ID, so
+cards linked to it keep working. Every edit needs `--yes`; `--dry-run` shows
+the result first.
+
+```sh
+yoto-cli content edit <CARD_ID> --title "Boer Boris" --author "Ted van Lieshout" --yes
+yoto-cli content append <CARD_ID> ./Boer\ Boris/Kaart\ 2 --yes   # new chapters at the end
+yoto-cli content chapter rename <CARD_ID> 3 "Het einde" --yes
+yoto-cli content chapter move <CARD_ID> 5 1 --yes                 # chapter 5 becomes chapter 1
+yoto-cli content chapter delete <CARD_ID> 4 6 --yes
+yoto-cli content chapter icon <CARD_ID> 2 icons/koe.png --yes     # or yoto:#<mediaId>
+```
+
+Chapter numbers are the ones `content show` prints. Chapters keep their
+internal keys when they move, and the number shown on the player follows the
+new position. `append` reads a folder the way `upload` does and checks the
+100-track limit including the tracks already in the playlist. Only an
+`icons.json` in the appended folder itself is used, numbering the new chapters
+from 1; one in the book folder belongs to the book's own chapters.
+
 ## Other commands
 
 ```sh
@@ -180,6 +204,7 @@ yoto-cli completions zsh > _yoto-cli
 | `10` | `transcode_timeout` | Yoto did not finish transcoding in time (retryable) |
 | `11` | `auth_failed` | the browser sign-in did not complete |
 | `12` | `token_store` | the keychain, token file or config could not be read or written |
+| `13` | `conflict` | the playlist changed while an edit was being prepared; nothing was saved (retryable) |
 
 ## For agents (clispec)
 

@@ -173,15 +173,21 @@ impl Plan {
 
     /// Check every Yoto limit that can be checked locally.
     pub fn check_limits(&self) -> Result<()> {
-        let fail = |message: String| Err(Error::LimitExceeded { message });
-        if self.tracks.is_empty() {
-            return Err(Error::invalid("the playlist has no audio files"));
-        }
         let chars = self.title.chars().count();
-        if chars == 0 || chars > MAX_TITLE_CHARS {
+        if !self.tracks.is_empty() && (chars == 0 || chars > MAX_TITLE_CHARS) {
             return Err(Error::invalid(format!(
                 "the playlist title must be 1 to {MAX_TITLE_CHARS} characters (it is {chars})"
             )));
+        }
+        self.check_audio_limits()
+    }
+
+    /// The limits on the audio alone, for chapters added to a playlist that
+    /// keeps its own title.
+    pub fn check_audio_limits(&self) -> Result<()> {
+        let fail = |message: String| Err(Error::LimitExceeded { message });
+        if self.tracks.is_empty() {
+            return Err(Error::invalid("the playlist has no audio files"));
         }
         if self.tracks.len() > MAX_TRACKS {
             return fail(format!(
@@ -439,7 +445,13 @@ pub fn from_dir(dir: &Path, icons_file: IconsFile) -> Result<Plan> {
         let first = tracks.len();
         if is_dir {
             let sub = dir.join(name);
-            let (sub_files, _) = list_dir(&sub)?;
+            let (sub_files, sub_dirs) = list_dir(&sub)?;
+            ignored.extend(
+                sub_dirs
+                    .iter()
+                    .filter(|d| !d.starts_with('.'))
+                    .map(|d| format!("{name}/{d}/")),
+            );
             for f in sub_files {
                 if is_audio_name(&f) {
                     tracks.push(planned_track(sub.join(&f), title_from_filename(&f))?);
@@ -821,6 +833,18 @@ mod tests {
         assert_eq!(json["tracks"][2]["chapter"], 2);
         assert_eq!(json["chapters"][1]["title"], "Vol. 2");
         assert_eq!(json["chapters"][1]["track_count"], 2);
+    }
+
+    #[test]
+    fn deeper_folders_are_reported_not_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Boek");
+        write(&dir.join("01 - Deel/01.mp3"), MP3);
+        write(&dir.join("01 - Deel/CD2/01.mp3"), MP3);
+        write(&dir.join("01 - Deel/.cache/x"), b"x");
+        let plan = from_dir(&dir, IconsFile::Detect).unwrap();
+        assert_eq!(plan.tracks.len(), 1);
+        assert_eq!(plan.ignored, ["01 - Deel/CD2/"]);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod edit;
 pub mod error;
 pub mod icons;
 pub mod keychain;
@@ -281,8 +282,10 @@ pub fn content_show(ctx: &Context, card_id: &str) -> Result<Output> {
         .and_then(Value::as_array)
         .map(|chs| {
             chs.iter()
-                .map(|ch| {
+                .enumerate()
+                .map(|(i, ch)| {
                     json!({
+                        "number": i + 1,
                         "key": ch.get("key"),
                         "title": ch.get("title"),
                         "icon": ch.pointer("/display/icon16x16"),
@@ -352,6 +355,434 @@ pub fn content_delete(ctx: &Context, card_id: &str, yes: bool) -> Result<Output>
         json: json!({"card_id": card_id, "title": title, "deleted": true}),
         text: format!("Deleted {title:?} ({card_id})."),
     })
+}
+
+/// Fail unless `card_id` is one of the signed-in user's own playlists. Yoto
+/// also serves playlists the user may only read, so the check is membership
+/// in the user's own list, not a readable GET.
+fn ensure_mine(client: &api::Client, card_id: &str) -> Result<()> {
+    if client
+        .list_mine()?
+        .iter()
+        .any(|c| c["cardId"].as_str() == Some(card_id))
+    {
+        Ok(())
+    } else {
+        Err(Error::NotFound {
+            message: format!("playlist {card_id} is not one of your playlists"),
+        })
+    }
+}
+
+/// A change to an existing playlist that needs no new audio.
+pub enum Change<'a> {
+    Details {
+        title: Option<&'a str>,
+        metadata: &'a metadata::Metadata,
+    },
+    RenameChapter {
+        number: usize,
+        title: &'a str,
+    },
+    DeleteChapters(&'a [usize]),
+    MoveChapter {
+        from: usize,
+        to: usize,
+    },
+    /// A `yoto:#` reference or an image file.
+    ChapterIcon {
+        number: usize,
+        icon: &'a str,
+    },
+}
+
+/// Whether a playlist change is only shown, still needs confirming, or is made.
+#[derive(Debug, Clone, Copy)]
+pub struct Confirm {
+    pub dry_run: bool,
+    pub yes: bool,
+}
+
+/// `content edit` and `content chapter ...`: change a playlist in place.
+/// The playlist keeps its card ID, so cards linked to it keep working.
+pub fn content_edit(
+    ctx: &Context,
+    card_id: &str,
+    change: &Change,
+    confirm: Confirm,
+    mut log: impl FnMut(String),
+) -> Result<Output> {
+    let icon = match change {
+        Change::ChapterIcon { icon, .. } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            Some(icons::Icon::parse(icon, &cwd)?)
+        }
+        Change::Details { title, metadata } => {
+            if title.is_none() && metadata.is_empty() {
+                return Err(Error::usage(
+                    "nothing to change; give --title or a detail such as --author",
+                ));
+            }
+            metadata.validate()?;
+            None
+        }
+        _ => None,
+    };
+    let client = ctx.client()?;
+    ensure_mine(&client, card_id)?;
+    let before = edit::editable(&client.get_content(card_id)?)?;
+    let apply = |card: &mut Value, icon_ref: Option<&str>| -> Result<String> {
+        Ok(match change {
+            Change::Details { title, metadata } => {
+                let mut set = Vec::new();
+                if let Some(t) = title {
+                    edit::set_title(card, t)?;
+                    set.push(format!("title to {:?}", t.trim()));
+                }
+                edit::apply_metadata(card, metadata)?;
+                set.extend(
+                    metadata
+                        .to_json()
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        // `authors` mirrors `author`, and an emptied list is
+                        // reported as a removal below.
+                        .filter(|(field, value)| {
+                            *field != "authors" && value.as_array().is_none_or(|a| !a.is_empty())
+                        })
+                        .map(|(field, value)| format!("{field} to {value}")),
+                );
+                let removed = metadata_removals(metadata);
+                let mut parts = Vec::new();
+                if !set.is_empty() {
+                    parts.push(format!("set {}", set.join(", ")));
+                }
+                if !removed.is_empty() {
+                    parts.push(format!("remove {}", removed.join(", ")));
+                }
+                parts.join("; ")
+            }
+            Change::RenameChapter { number, title } => {
+                edit::rename_chapter(card, *number, title)?;
+                format!("rename chapter {number} to {:?}", title.trim())
+            }
+            Change::DeleteChapters(numbers) => {
+                edit::delete_chapters(card, numbers)?;
+                let list: Vec<String> = numbers.iter().map(usize::to_string).collect();
+                format!(
+                    "delete chapter{} {}",
+                    if numbers.len() == 1 { "" } else { "s" },
+                    list.join(", ")
+                )
+            }
+            Change::MoveChapter { from, to } => {
+                edit::move_chapter(card, *from, *to)?;
+                format!("move chapter {from} to position {to}")
+            }
+            Change::ChapterIcon { number, .. } => {
+                let icon = icon.as_ref().expect("parsed above");
+                edit::set_chapter_icon(card, *number, icon_ref.unwrap_or(&icon.describe()))?;
+                format!("set the icon of chapter {number} to {}", icon.describe())
+            }
+        })
+    };
+    // Only removing tracks changes the totals; any other edit keeps them as
+    // Yoto stored them.
+    let recompute = |card: &mut Value| {
+        if matches!(change, Change::DeleteChapters(_)) {
+            edit::recompute_media(card);
+        }
+    };
+    let mut after = before.clone();
+    let what = apply(&mut after, None)?;
+    recompute(&mut after);
+    if after == before {
+        let mut out = edit_output(card_id, &after, &what, EditState::Unchanged);
+        out.json["dry_run"] = json!(confirm.dry_run);
+        return Ok(out);
+    }
+    if confirm.dry_run {
+        return Ok(edit_output(card_id, &after, &what, EditState::DryRun));
+    }
+    if !confirm.yes {
+        return Err(confirmation(card_id, &before, &what));
+    }
+    if let Some(icon @ icons::Icon::File(_)) = &icon {
+        let reference = upload::resolve_icon(&client, icon, &mut Default::default(), &mut log)?;
+        after = before.clone();
+        apply(&mut after, Some(&reference))?;
+        recompute(&mut after);
+    }
+    save(&client, card_id, &before, &after, &mut log)?;
+    Ok(edit_output(card_id, &after, &what, EditState::Saved))
+}
+
+/// The text fields an edit removes by giving them as "".
+fn metadata_removals(m: &metadata::Metadata) -> Vec<String> {
+    [
+        ("author", &m.author),
+        ("narrators", &m.read_by),
+        ("description", &m.description),
+        ("languages", &m.language),
+    ]
+    .into_iter()
+    .filter(|(_, v)| v.as_deref().is_some_and(|v| v.trim().is_empty()))
+    .map(|(f, _)| f.to_string())
+    .collect()
+}
+
+pub struct AppendOptions<'a> {
+    pub dir: &'a Path,
+    /// An icons.json to use instead of the detected one; its chapter numbers
+    /// count the appended chapters from 1.
+    pub icons: Option<PathBuf>,
+    /// Icon for every appended chapter the icons.json does not name.
+    pub icon: Option<String>,
+    pub no_icons: bool,
+    pub confirm: Confirm,
+    pub transcode_timeout: Duration,
+}
+
+/// `content append`: add a folder's audio as new chapters at the end of a
+/// playlist, keeping its card ID and its existing chapters.
+pub fn content_append(
+    ctx: &Context,
+    card_id: &str,
+    opts: &AppendOptions,
+    mut log: impl FnMut(String),
+) -> Result<Output> {
+    // Only an icons.json in the appended folder itself numbers the appended
+    // chapters; one in the book folder numbers the book's own chapters.
+    let detected = icons::find(&[opts.dir]);
+    let icons_file = match (&opts.icons, opts.no_icons, &detected) {
+        (_, true, _) => plan::IconsFile::Ignore,
+        (Some(path), false, _) => plan::IconsFile::Path(path),
+        (None, false, Some(path)) => plan::IconsFile::Path(path),
+        (None, false, None) => plan::IconsFile::Ignore,
+    };
+    let mut plan = plan::from_dir(opts.dir, icons_file)?;
+    if let Some(spec) = &opts.icon {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        plan.icons.default = Some(icons::Icon::parse(spec, &cwd)?);
+    }
+    plan.check_audio_limits()?;
+    let client = ctx.client()?;
+    ensure_mine(&client, card_id)?;
+    let before = edit::editable(&client.get_content(card_id)?)?;
+    let total = edit::track_count(&before) + plan.tracks.len();
+    if total > plan::MAX_TRACKS {
+        return Err(Error::LimitExceeded {
+            message: format!(
+                "the playlist has {} tracks; adding {} makes {total}, above Yoto's limit of {}",
+                edit::track_count(&before),
+                plan.tracks.len(),
+                plan::MAX_TRACKS
+            ),
+        });
+    }
+    let bytes = edit::known_bytes(&before) + plan.total_bytes();
+    if bytes > plan::MAX_PLAYLIST_BYTES {
+        return Err(Error::LimitExceeded {
+            message: format!(
+                "the playlist holds {} bytes; adding {} makes {bytes}, above Yoto's limit of {}",
+                edit::known_bytes(&before),
+                plan.total_bytes(),
+                plan::MAX_PLAYLIST_BYTES
+            ),
+        });
+    }
+    let existing = edit::chapter_count(&before);
+    let what = format!(
+        "append {} chapter{} ({} track{}, {})",
+        plan.chapters.len(),
+        if plan.chapters.len() == 1 { "" } else { "s" },
+        plan.tracks.len(),
+        if plan.tracks.len() == 1 { "" } else { "s" },
+        format_mb(plan.total_bytes())
+    );
+    if opts.confirm.dry_run {
+        let mut out = edit_output(card_id, &before, &what, EditState::DryRun);
+        let mut new = plan.to_json();
+        // Number the planned chapters as they will appear in the playlist.
+        for ch in new["chapters"].as_array_mut().into_iter().flatten() {
+            let n = ch["number"].as_u64().unwrap_or(0) as usize;
+            ch["number"] = json!(existing + n);
+        }
+        for t in new["tracks"].as_array_mut().into_iter().flatten() {
+            let n = t["chapter"].as_u64().unwrap_or(0) as usize;
+            t["chapter"] = json!(existing + n);
+        }
+        out.text.push_str("New chapters:\n");
+        for ch in new["chapters"].as_array().into_iter().flatten() {
+            out.text.push_str(&format!(
+                "{:>3}. {}\n",
+                ch["number"].as_u64().unwrap_or(0),
+                ch["title"].as_str().unwrap_or("")
+            ));
+        }
+        if !plan.ignored.is_empty() {
+            out.text
+                .push_str(&format!("Ignored: {}\n", plan.ignored.join(", ")));
+        }
+        // Describe the playlist as it would be, existing chapters first.
+        let new_chapters = new["chapters"].as_array().cloned().unwrap_or_default();
+        if let Some(chapters) = out.json["chapters"].as_array_mut() {
+            chapters.extend(new_chapters.iter().map(|ch| {
+                let mut ch = ch.clone();
+                ch["key"] = Value::Null;
+                ch
+            }));
+        }
+        out.json["chapter_count"] = json!(existing + plan.chapters.len());
+        out.json["track_count"] = json!(total);
+        out.json["duration_seconds"] = match (
+            before
+                .pointer("/metadata/media/duration")
+                .and_then(Value::as_f64),
+            plan.total_seconds(),
+        ) {
+            (Some(a), Some(b)) => json!(a + b),
+            _ => Value::Null,
+        };
+        out.json["new_chapters"] = new["chapters"].take();
+        out.json["new_tracks"] = new["tracks"].take();
+        out.json["ignored"] = json!(plan.ignored);
+        return Ok(out);
+    }
+    if !opts.confirm.yes {
+        return Err(confirmation(card_id, &before, &what));
+    }
+    let n = plan.tracks.len();
+    let hashes = plan::hash_tracks(&plan, |i, t| {
+        log(format!("[{}/{n}] checking {}", i + 1, t.title))
+    })?;
+    let icon_refs = upload::upload_icons(&client, &plan, &mut log)?;
+    let done = upload::upload_tracks(&client, &plan, &hashes, opts.transcode_timeout, &mut log)?;
+    let bodies: Vec<upload::ChapterBody> = plan
+        .chapters
+        .iter()
+        .zip(&icon_refs)
+        .map(|(c, icon)| upload::ChapterBody {
+            title: &c.title,
+            icon,
+            tracks: &done[c.tracks.clone()],
+        })
+        .collect();
+    let mut body =
+        upload::content_body(&plan.title, &bodies, None, &metadata::Metadata::default())?;
+    let new: Vec<Value> = match body["content"]["chapters"].take() {
+        Value::Array(chs) => chs,
+        _ => unreachable!("content_body builds a chapters array"),
+    };
+    let mut after = before.clone();
+    edit::append_chapters(&mut after, new)?;
+    plan::check_transcoded_bytes(edit::known_bytes(&after))?;
+    edit::recompute_media(&mut after);
+    save(&client, card_id, &before, &after, &mut log)?;
+    let mut out = edit_output(card_id, &after, &what, EditState::Saved);
+    out.json["uploaded"] = json!(done.iter().filter(|u| !u.reused).count());
+    out.json["reused"] = json!(done.iter().filter(|u| u.reused).count());
+    Ok(out)
+}
+
+/// Send the changed playlist back under its own card ID, once it is clear
+/// the stored playlist is still the `before` the change was made to. An edit
+/// can wait minutes on uploads; saving over a newer version would silently
+/// undo whatever changed it.
+fn save(
+    client: &api::Client,
+    card_id: &str,
+    before: &Value,
+    card: &Value,
+    log: &mut impl FnMut(String),
+) -> Result<()> {
+    if edit::editable(&client.get_content(card_id)?)? != *before {
+        return Err(Error::Conflict {
+            message: format!(
+                "playlist {card_id} changed while this edit was being prepared; nothing was saved"
+            ),
+        });
+    }
+    log(format!("saving playlist {card_id}"));
+    let saved = client.create_content(card)?;
+    match saved.get("cardId").and_then(Value::as_str) {
+        Some(id) if id == card_id => Ok(()),
+        other => Err(Error::Api {
+            status: 200,
+            message: format!(
+                "saving playlist {card_id}: Yoto answered with card {}",
+                other.unwrap_or("(none)")
+            ),
+        }),
+    }
+}
+
+fn confirmation(card_id: &str, card: &Value, what: &str) -> Error {
+    Error::ConfirmationRequired {
+        message: format!(
+            "this would {what} in playlist {card_id} ({:?}), and cards linked to it play the changed version; check it with --dry-run, then re-run with --yes",
+            card["title"].as_str().unwrap_or("")
+        ),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditState {
+    Unchanged,
+    DryRun,
+    Saved,
+}
+
+/// The playlist details a `content edit` can set, under their Yoto names.
+fn details(card: &Value) -> Value {
+    let metadata = card.get("metadata");
+    Value::Object(
+        metadata::FIELDS
+            .iter()
+            .filter_map(|f| {
+                metadata
+                    .and_then(|m| m.get(*f))
+                    .map(|v| (f.to_string(), v.clone()))
+            })
+            .collect(),
+    )
+}
+
+fn edit_output(card_id: &str, card: &Value, what: &str, state: EditState) -> Output {
+    let chapters = edit::chapter_summary(card);
+    let title = card["title"].as_str().unwrap_or("");
+    let json = json!({
+        "card_id": card_id,
+        "title": title,
+        "change": what,
+        "dry_run": state == EditState::DryRun,
+        "changed": state == EditState::Saved,
+        "chapter_count": chapters.len(),
+        "track_count": edit::track_count(card),
+        "duration_seconds": card.pointer("/metadata/media/duration"),
+        "metadata": details(card),
+        "chapters": chapters,
+    });
+    let mut text = match state {
+        EditState::Unchanged => format!("No change: {title:?} ({card_id}) already matches.\n"),
+        EditState::DryRun => format!("Would {what} in {title:?} ({card_id}).\n"),
+        EditState::Saved => format!(
+            "Saved {title:?} ({card_id}): {what}. Cards linked to it play the changed version.\n"
+        ),
+    };
+    for ch in &chapters {
+        text.push_str(&format!(
+            "{:>3}. {}{}\n",
+            ch["number"].as_u64().unwrap_or(0),
+            ch["title"].as_str().unwrap_or(""),
+            match ch["track_count"].as_u64() {
+                Some(n) if n > 1 => format!(" ({n} tracks)"),
+                _ => String::new(),
+            }
+        ));
+    }
+    Output { json, text }
 }
 
 pub enum Source<'a> {
@@ -523,18 +954,8 @@ pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) 
 
     let client = ctx.client()?;
     if let Some(id) = &opts.replace {
-        // Fail before uploading anything if the playlist is missing or not
-        // ours. Yoto also serves playlists the user may only read, so the
-        // check is membership in the user's own list, not a readable GET.
-        let mine = client.list_mine()?;
-        if !mine
-            .iter()
-            .any(|c| c["cardId"].as_str() == Some(id.as_str()))
-        {
-            return Err(Error::NotFound {
-                message: format!("playlist {id} is not one of your playlists"),
-            });
-        }
+        // Fail before uploading anything if the playlist is missing or not ours.
+        ensure_mine(&client, id)?;
     }
     let result = upload::run(
         &client,

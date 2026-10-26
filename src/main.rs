@@ -12,7 +12,10 @@ use std::time::Duration;
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::json;
-use yoto_cli::{Context, Error, LoginOptions, OutputFormat, Source, UploadOptions, schema};
+use yoto_cli::{
+    AppendOptions, Change, Context, Error, LoginOptions, OutputFormat, Source, UploadOptions,
+    schema,
+};
 
 #[derive(Parser)]
 #[command(
@@ -181,6 +184,110 @@ enum ContentCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Change a playlist's title or details; cards linked to it keep working.
+    Edit {
+        /// Card ID, as shown by `content list`.
+        card_id: String,
+        /// New playlist title.
+        #[arg(long)]
+        title: Option<String>,
+        #[command(flatten)]
+        metadata: Box<MetadataArgs>,
+        #[command(flatten)]
+        confirm: ConfirmArgs,
+    },
+    /// Add a folder's audio as new chapters at the end of a playlist.
+    Append {
+        /// Card ID, as shown by `content list`.
+        card_id: String,
+        /// Folder of audio, read as `upload` reads it; each file is a chapter, each subfolder one chapter.
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+        /// icons.json to use instead of DIR/icons.json; chapter numbers count the new chapters from 1.
+        #[arg(long, value_name = "FILE", conflicts_with = "no_icons")]
+        icons: Option<PathBuf>,
+        /// Icon for every new chapter the icons.json does not name: yoto:#<mediaId> or an image file.
+        #[arg(long, value_name = "ICON", conflicts_with = "no_icons")]
+        icon: Option<String>,
+        /// Ignore icons.json and give every new chapter the default icon.
+        #[arg(long)]
+        no_icons: bool,
+        #[command(flatten)]
+        confirm: ConfirmArgs,
+        /// Seconds to wait for Yoto to transcode each track.
+        #[arg(long, default_value_t = 600, value_name = "SECONDS")]
+        transcode_timeout: u64,
+    },
+    /// Rename, delete, move or re-icon chapters of a playlist.
+    #[command(subcommand)]
+    Chapter(ChapterCommand),
+}
+
+#[derive(Subcommand)]
+enum ChapterCommand {
+    /// Rename a chapter (and its track, when it has one).
+    Rename {
+        /// Card ID, as shown by `content list`.
+        card_id: String,
+        /// Chapter number, as shown by `content show`.
+        number: usize,
+        /// New chapter title.
+        title: String,
+        #[command(flatten)]
+        confirm: ConfirmArgs,
+    },
+    /// Delete chapters; the rest are renumbered.
+    Delete {
+        /// Card ID, as shown by `content list`.
+        card_id: String,
+        /// Chapter numbers, as shown by `content show`.
+        #[arg(required = true, num_args = 1..)]
+        numbers: Vec<usize>,
+        #[command(flatten)]
+        confirm: ConfirmArgs,
+    },
+    /// Move a chapter to another position.
+    Move {
+        /// Card ID, as shown by `content list`.
+        card_id: String,
+        /// Chapter number to move.
+        from: usize,
+        /// Position it moves to.
+        to: usize,
+        #[command(flatten)]
+        confirm: ConfirmArgs,
+    },
+    /// Set the icon shown while a chapter plays.
+    Icon {
+        /// Card ID, as shown by `content list`.
+        card_id: String,
+        /// Chapter number, as shown by `content show`.
+        number: usize,
+        /// yoto:#<mediaId> (see `icons list`) or a PNG, GIF or JPEG file.
+        icon: String,
+        #[command(flatten)]
+        confirm: ConfirmArgs,
+    },
+}
+
+/// How a change to a playlist is confirmed.
+#[derive(clap::Args)]
+struct ConfirmArgs {
+    /// Show the change without making it.
+    #[arg(long)]
+    dry_run: bool,
+    /// Confirm the change.
+    #[arg(long, short = 'y')]
+    yes: bool,
+}
+
+impl From<ConfirmArgs> for yoto_cli::Confirm {
+    fn from(a: ConfirmArgs) -> Self {
+        yoto_cli::Confirm {
+            dry_run: a.dry_run,
+            yes: a.yes,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -281,6 +388,98 @@ fn dispatch(ctx: &Context, command: Command) -> yoto_cli::Result<yoto_cli::Outpu
         Command::Content(ContentCommand::Show { card_id }) => yoto_cli::content_show(ctx, &card_id),
         Command::Content(ContentCommand::Delete { card_id, yes }) => {
             yoto_cli::content_delete(ctx, &card_id, yes)
+        }
+        Command::Content(ContentCommand::Edit {
+            card_id,
+            title,
+            metadata,
+            confirm,
+        }) => {
+            let metadata = (*metadata).into();
+            yoto_cli::content_edit(
+                ctx,
+                &card_id,
+                &Change::Details {
+                    title: title.as_deref(),
+                    metadata: &metadata,
+                },
+                confirm.into(),
+                progress,
+            )
+        }
+        Command::Content(ContentCommand::Append {
+            card_id,
+            dir,
+            icons,
+            icon,
+            no_icons,
+            confirm,
+            transcode_timeout,
+        }) => yoto_cli::content_append(
+            ctx,
+            &card_id,
+            &AppendOptions {
+                dir: &dir,
+                icons,
+                icon,
+                no_icons,
+                confirm: confirm.into(),
+                transcode_timeout: Duration::from_secs(transcode_timeout),
+            },
+            progress,
+        ),
+        Command::Content(ContentCommand::Chapter(cmd)) => {
+            let (card_id, change, confirm) = match &cmd {
+                ChapterCommand::Rename {
+                    card_id,
+                    number,
+                    title,
+                    confirm,
+                } => (
+                    card_id,
+                    Change::RenameChapter {
+                        number: *number,
+                        title,
+                    },
+                    confirm,
+                ),
+                ChapterCommand::Delete {
+                    card_id,
+                    numbers,
+                    confirm,
+                } => (card_id, Change::DeleteChapters(numbers), confirm),
+                ChapterCommand::Move {
+                    card_id,
+                    from,
+                    to,
+                    confirm,
+                } => (
+                    card_id,
+                    Change::MoveChapter {
+                        from: *from,
+                        to: *to,
+                    },
+                    confirm,
+                ),
+                ChapterCommand::Icon {
+                    card_id,
+                    number,
+                    icon,
+                    confirm,
+                } => (
+                    card_id,
+                    Change::ChapterIcon {
+                        number: *number,
+                        icon,
+                    },
+                    confirm,
+                ),
+            };
+            let confirm = yoto_cli::Confirm {
+                dry_run: confirm.dry_run,
+                yes: confirm.yes,
+            };
+            yoto_cli::content_edit(ctx, card_id, &change, confirm, progress)
         }
         Command::Icons(IconsCommand::List { query, mine }) => {
             yoto_cli::icons_list(ctx, mine, &query)

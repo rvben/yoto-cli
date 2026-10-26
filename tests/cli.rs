@@ -310,6 +310,8 @@ fn content_list_show_and_delete_against_the_api() {
     );
     assert_eq!(out.json()["chapters"][0]["icon"], "yoto:#tractorIcon");
     assert_eq!(out.json()["chapters"][1]["icon"], Value::Null);
+    assert_eq!(out.json()["chapters"][0]["number"], 1);
+    assert_eq!(out.json()["chapters"][1]["number"], 2);
 
     // Expect exactly one DELETE across both runs: the one without --yes sends none.
     let delete = server
@@ -1033,4 +1035,732 @@ fn every_error_envelope_kind_is_declared_with_its_exit_code() {
             "{kind} is not declared"
         );
     }
+}
+
+/// A playlist as `GET /content/{id}` returns it: fields Yoto keeps itself,
+/// fields an edit must send back untouched, and three chapters (the second
+/// with two tracks, the third with a custom label).
+fn stored_card() -> Value {
+    let track = |key: &str, title: &str, label: &str, sha: &str| {
+        json!({"key": key, "title": title, "trackUrl": format!("yoto:#{sha}"), "duration": 60.0,
+               "fileSize": 1000, "format": "aac", "type": "audio", "overlayLabel": label,
+               "display": {"icon16x16": DEFAULT_ICON}})
+    };
+    json!({
+        "cardId": "abc12",
+        "title": "Boer Boris",
+        "createdAt": "2026-10-01T10:00:00.000Z",
+        "updatedAt": "2026-10-02T10:00:00.000Z",
+        "userId": "auth0|owner",
+        "content": {
+            "config": {"autoadvance": "next"},
+            "chapters": [
+                {"key": "01", "title": "Een", "overlayLabel": "1", "display": {"icon16x16": DEFAULT_ICON},
+                 "tracks": [track("01", "Een", "1", "s1")]},
+                {"key": "02", "title": "Lied", "overlayLabel": "2", "display": {"icon16x16": DEFAULT_ICON},
+                 "tracks": [track("01", "Couplet", "2", "s2"), track("02", "Refrein", "2", "s3")]},
+                {"key": "03", "title": "Toegift", "overlayLabel": "T", "display": {"icon16x16": DEFAULT_ICON},
+                 "tracks": [track("01", "Toegift", "T", "s4")]},
+            ],
+        },
+        // Yoto returns the people as lists beside the derived `author`.
+        "metadata": {"author": "Ted", "authors": ["Ted"], "narrators": [], "cover": {"imageL": "https://cdn.example.com/c.png"},
+                     "media": {"duration": 240.0, "fileSize": 4000}},
+    })
+}
+
+/// The user's own playlists and the stored card.
+fn mock_stored(server: &mut Server, card: &Value) -> Vec<mockito::Mock> {
+    vec![
+        server
+            .mock("GET", "/content/mine")
+            .with_body(json!({"cards": [{"cardId": "abc12", "title": "Boer Boris"}]}).to_string())
+            .create(),
+        server
+            .mock("GET", "/content/abc12")
+            .with_body(json!({"card": card}).to_string())
+            .create(),
+    ]
+}
+
+fn keys(body: &Value) -> Vec<(String, String, String)> {
+    body["content"]["chapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["key"].as_str().unwrap().to_string(),
+                c["overlayLabel"].as_str().unwrap().to_string(),
+                c["title"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn s3(a: &str, b: &str, c: &str) -> (String, String, String) {
+    (a.into(), b.into(), c.into())
+}
+
+#[test]
+fn edits_are_confirmed_then_saved_under_the_same_card_id() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let _stored = mock_stored(&mut server, &stored_card());
+    let (create, seen) = mock_create(&mut server, json!({"cardId": "abc12"}), "abc12");
+
+    // Neither an unconfirmed run nor a dry run saves anything.
+    let out = env.run(&["content", "chapter", "move", "abc12", "1", "3"]);
+    assert_eq!(out.code, 5, "{}", out.stderr);
+    assert_eq!(out.error()["kind"], "confirmation_required");
+    assert!(
+        out.error()["message"]
+            .as_str()
+            .unwrap()
+            .contains("move chapter 1")
+    );
+    let out = env.run(&["content", "chapter", "move", "abc12", "1", "3", "--dry-run"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["dry_run"], true);
+    assert_eq!(out.json()["changed"], false);
+    let titles: Vec<_> = out.json()["chapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["title"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(titles, ["Lied", "Toegift", "Een"]);
+
+    let out = env.run(&["content", "chapter", "move", "abc12", "1", "3", "--yes"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["changed"], true);
+    create.assert();
+    let body = seen.lock().unwrap()[0].clone();
+    // Keys stay with their chapters; number labels follow the positions and
+    // a custom label stays.
+    assert_eq!(
+        keys(&body),
+        [
+            s3("02", "1", "Lied"),
+            s3("03", "T", "Toegift"),
+            s3("01", "3", "Een")
+        ]
+    );
+    assert_eq!(
+        body["content"]["chapters"][0]["tracks"][1]["overlayLabel"],
+        "1"
+    );
+    // What Yoto keeps itself is not sent; everything else goes back as it was.
+    assert!(body.get("userId").is_none() && body.get("updatedAt").is_none());
+    assert_eq!(body["createdAt"], "2026-10-01T10:00:00.000Z");
+    assert_eq!(body["content"]["config"]["autoadvance"], "next");
+    assert_eq!(
+        body["metadata"]["cover"]["imageL"],
+        "https://cdn.example.com/c.png"
+    );
+    assert_eq!(body["metadata"]["author"], "Ted");
+    assert_eq!(body["metadata"]["media"]["duration"], 240.0);
+    assert_eq!(
+        body["content"]["chapters"][2]["tracks"][0]["trackUrl"],
+        "yoto:#s1"
+    );
+}
+
+#[test]
+fn each_chapter_command_sends_its_change() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let _stored = mock_stored(&mut server, &stored_card());
+
+    let run = |server: &mut Server, args: &[&str]| -> Value {
+        let (create, seen) = mock_create(server, json!({"cardId": "abc12"}), "abc12");
+        let out = env.run(args);
+        assert_eq!(out.code, 0, "{args:?}: {}", out.stderr);
+        create.assert();
+        create.remove();
+        seen.lock().unwrap()[0].clone()
+    };
+
+    let body = run(
+        &mut server,
+        &[
+            "content", "chapter", "rename", "abc12", "1", "Begin", "--yes",
+        ],
+    );
+    assert_eq!(body["content"]["chapters"][0]["title"], "Begin");
+    assert_eq!(
+        body["content"]["chapters"][0]["tracks"][0]["title"],
+        "Begin"
+    );
+
+    let body = run(
+        &mut server,
+        &["content", "chapter", "delete", "abc12", "1", "--yes"],
+    );
+    assert_eq!(
+        keys(&body),
+        [s3("02", "1", "Lied"), s3("03", "T", "Toegift")]
+    );
+    assert_eq!(body["metadata"]["media"]["duration"], 180.0);
+    assert_eq!(body["metadata"]["media"]["fileSize"], 3000);
+
+    // A chapter that does not exist stops the command before anything is sent.
+    let out = env.run(&["content", "chapter", "delete", "abc12", "7", "--yes"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(out.error()["kind"], "invalid_input");
+
+    let icon = format!("yoto:#{ICON_ID}");
+    let body = run(
+        &mut server,
+        &["content", "chapter", "icon", "abc12", "2", &icon, "--yes"],
+    );
+    let lied = &body["content"]["chapters"][1];
+    assert_eq!(lied["display"]["icon16x16"], icon.as_str());
+    assert_eq!(lied["tracks"][1]["display"]["icon16x16"], icon.as_str());
+    assert_eq!(
+        body["content"]["chapters"][0]["display"]["icon16x16"],
+        DEFAULT_ICON
+    );
+
+    let body = run(
+        &mut server,
+        &[
+            "content",
+            "edit",
+            "abc12",
+            "--title",
+            "Boer Boris 2",
+            "--author",
+            "",
+            "--min-age",
+            "3",
+            "--yes",
+        ],
+    );
+    assert_eq!(body["title"], "Boer Boris 2");
+    assert!(body["metadata"].get("author").is_none());
+    assert_eq!(body["metadata"]["minAge"], 3);
+    assert_eq!(keys(&body).len(), 3);
+}
+
+#[test]
+fn an_icon_file_is_uploaded_only_once_the_change_is_confirmed() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let _stored = mock_stored(&mut server, &stored_card());
+    std::fs::write(env.tmp.path().join("koe.png"), png16()).unwrap();
+    let icon = server
+        .mock("POST", "/media/displayIcons/user/me/upload")
+        .match_query(Matcher::UrlEncoded("filename".into(), "koe".into()))
+        .with_body(json!({"displayIcon": {"mediaId": "uploadedKoeIcon"}}).to_string())
+        .expect(1)
+        .create();
+    let out = env.run(&[
+        "content",
+        "chapter",
+        "icon",
+        "abc12",
+        "1",
+        "koe.png",
+        "--dry-run",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let out = env.run(&["content", "chapter", "icon", "abc12", "1", "koe.png"]);
+    assert_eq!(out.code, 5, "{}", out.stderr);
+    let (create, seen) = mock_create(&mut server, json!({"cardId": "abc12"}), "abc12");
+    let out = env.run(&[
+        "content", "chapter", "icon", "abc12", "1", "koe.png", "--yes",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    icon.assert();
+    create.assert();
+    let body = seen.lock().unwrap()[0].clone();
+    assert_eq!(
+        body["content"]["chapters"][0]["tracks"][0]["display"]["icon16x16"],
+        "yoto:#uploadedKoeIcon"
+    );
+}
+
+#[test]
+fn edits_refuse_what_they_cannot_do_safely_without_saving() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let mut signed = stored_card();
+    signed["content"]["chapters"][1]["tracks"][0]["trackUrl"] =
+        json!("https://cdn.example.com/a.mp3?Signature=x");
+    let _stored = mock_stored(&mut server, &signed);
+    server
+        .mock("GET", "/content/other")
+        .with_body(json!({"card": stored_card()}).to_string())
+        .create();
+    let none = server.mock("POST", "/content").expect(0).create();
+
+    let cases: [(&[&str], i32, &str); 5] = [
+        (&["content", "edit", "abc12", "--yes"], 3, "usage"),
+        (
+            &["content", "edit", "other", "--author", "x", "--yes"],
+            7,
+            "not_found",
+        ),
+        (
+            &["content", "chapter", "rename", "abc12", "1", "x", "--yes"],
+            8,
+            "api_error",
+        ),
+        (
+            &["content", "edit", "abc12", "--min-age", "120", "--yes"],
+            1,
+            "invalid_input",
+        ),
+        (
+            &[
+                "content", "chapter", "icon", "abc12", "1", "nope.png", "--yes",
+            ],
+            1,
+            "invalid_input",
+        ),
+    ];
+    for (args, code, kind) in cases {
+        let out = env.run(args);
+        assert_eq!(out.code, code, "{args:?}: {}", out.stderr);
+        assert_eq!(out.error()["kind"], kind, "{args:?}");
+    }
+    none.assert();
+}
+
+#[test]
+fn append_adds_new_chapters_after_the_old_ones() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let dir = book(env.tmp.path());
+    let _stored = mock_stored(&mut server, &stored_card());
+
+    let out = env.run(&[
+        "content",
+        "append",
+        "abc12",
+        dir.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let numbers: Vec<_> = out.json()["new_chapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers, [4, 5]);
+    assert_eq!(out.json()["new_tracks"][1]["chapter"], 5);
+    // The dry run describes the playlist as it would be after appending.
+    assert_eq!(out.json()["chapter_count"], 5);
+    assert_eq!(out.json()["track_count"], 6);
+    let titles: Vec<_> = out.json()["chapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["number"].as_u64().unwrap(), c["title"].clone()))
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            (1, json!("Een")),
+            (2, json!("Lied")),
+            (3, json!("Toegift")),
+            (4, json!("Het begin")),
+            (5, json!("Het einde"))
+        ]
+    );
+    let out = env.run(&["content", "append", "abc12", dir.to_str().unwrap()]);
+    assert_eq!(out.code, 5, "{}", out.stderr);
+
+    let _t1 = mock_track(
+        &mut server,
+        &sha256_hex(&dir.join("01 - Het begin.mp3")),
+        1,
+        false,
+    );
+    let _t2 = mock_track(
+        &mut server,
+        &sha256_hex(&dir.join("02 - Het einde.mp3")),
+        2,
+        false,
+    );
+    let (create, seen) = mock_create(&mut server, json!({"cardId": "abc12"}), "abc12");
+    let out = env.run(&[
+        "content",
+        "append",
+        "abc12",
+        dir.to_str().unwrap(),
+        "--no-icons",
+        "--yes",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["chapter_count"], 5);
+    assert_eq!(out.json()["reused"], 2);
+    create.assert();
+    let body = seen.lock().unwrap()[0].clone();
+    assert_eq!(
+        keys(&body),
+        [
+            s3("01", "1", "Een"),
+            s3("02", "2", "Lied"),
+            s3("03", "T", "Toegift"),
+            s3("04", "4", "Het begin"),
+            s3("05", "5", "Het einde")
+        ]
+    );
+    assert_eq!(
+        body["content"]["chapters"].as_array().unwrap()[..3],
+        stored_card()["content"]["chapters"].as_array().unwrap()[..]
+    );
+    let new = &body["content"]["chapters"][4]["tracks"][0];
+    assert_eq!(new["trackUrl"], "yoto:#t2");
+    assert_eq!(new["overlayLabel"], "5");
+    // 240 s before, plus 60 s and 120 s from the mocked transcodes.
+    assert_eq!(body["metadata"]["media"]["duration"], 420.0);
+    assert_eq!(body["metadata"]["author"], "Ted");
+}
+
+#[test]
+fn append_reads_only_the_folder_it_is_given() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let _stored = mock_stored(&mut server, &stored_card());
+    // The book's icons.json numbers the book's chapters, not the appended ones,
+    // and the folder's name is not a playlist title, however long it is.
+    let book = env.tmp.path().join("Boek");
+    let dir = book.join("d".repeat(150));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("01 - Nieuw.mp3"), b"ID3\x04\x00 new track").unwrap();
+    std::fs::write(
+        book.join("icons.json"),
+        json!({"1": format!("yoto:#{ICON_ID}")}).to_string(),
+    )
+    .unwrap();
+    let out = env.run(&[
+        "content",
+        "append",
+        "abc12",
+        dir.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["new_chapters"][0]["icon"], Value::Null);
+    assert_eq!(out.json()["title"], stored_card()["title"]);
+    assert_eq!(out.json()["change"], "append 1 chapter (1 track, 0.0 MB)");
+}
+
+#[test]
+fn append_counts_the_existing_tracks_against_the_limit() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let dir = book(env.tmp.path());
+    let mut card = stored_card();
+    let one = card["content"]["chapters"][0].clone();
+    let chapters = card["content"]["chapters"].as_array_mut().unwrap();
+    chapters.clear();
+    for i in 0..99 {
+        let mut c = one.clone();
+        c["key"] = json!(format!("{:02}", i + 1));
+        chapters.push(c);
+    }
+    let _stored = mock_stored(&mut server, &card);
+    let none = server.mock("POST", "/content").expect(0).create();
+    let out = env.run(&[
+        "content",
+        "append",
+        "abc12",
+        dir.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(out.code, 6, "{}", out.stderr);
+    assert_eq!(out.error()["kind"], "limit_exceeded");
+    none.assert();
+}
+
+#[test]
+fn append_counts_the_existing_audio_against_the_size_limit() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let dir = book(env.tmp.path());
+    let mut card = stored_card();
+    // 4 tracks 8 bytes short of 500 MB together; the two new files add 38.
+    for ch in card["content"]["chapters"].as_array_mut().unwrap() {
+        for t in ch["tracks"].as_array_mut().unwrap() {
+            t["fileSize"] = json!(124_999_998);
+        }
+    }
+    let _stored = mock_stored(&mut server, &card);
+    let none = server.mock("POST", "/content").expect(0).create();
+    let no_upload = server
+        .mock(
+            "GET",
+            Matcher::Regex("^/media/transcode/audio/uploadUrl".into()),
+        )
+        .expect(0)
+        .create();
+    for extra in [&["--dry-run"][..], &["--no-icons", "--yes"][..]] {
+        let mut args = vec!["content", "append", "abc12", dir.to_str().unwrap()];
+        args.extend(extra);
+        let out = env.run(&args);
+        assert_eq!(out.code, 6, "{extra:?}: {}", out.stderr);
+        assert_eq!(out.error()["kind"], "limit_exceeded");
+        assert!(
+            out.error()["message"].as_str().unwrap().contains("bytes"),
+            "{}",
+            out.stderr
+        );
+    }
+    none.assert();
+    no_upload.assert();
+}
+
+#[test]
+fn the_size_limit_is_checked_again_on_the_transcoded_audio() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let dir = book(env.tmp.path());
+    // 50 kB below the limit: room for the 38-byte sources, but not for the
+    // 20 kB and 40 kB Yoto reports once they are transcoded.
+    let mut card = stored_card();
+    for ch in card["content"]["chapters"].as_array_mut().unwrap() {
+        for t in ch["tracks"].as_array_mut().unwrap() {
+            t["fileSize"] = json!(124_987_500);
+        }
+    }
+    let _stored = mock_stored(&mut server, &card);
+    let _t1 = mock_track(
+        &mut server,
+        &sha256_hex(&dir.join("01 - Het begin.mp3")),
+        20,
+        false,
+    );
+    let _t2 = mock_track(
+        &mut server,
+        &sha256_hex(&dir.join("02 - Het einde.mp3")),
+        40,
+        false,
+    );
+    let none = server.mock("POST", "/content").expect(0).create();
+    let out = env.run(&[
+        "content",
+        "append",
+        "abc12",
+        dir.to_str().unwrap(),
+        "--no-icons",
+        "--yes",
+    ]);
+    assert_eq!(out.code, 6, "{}", out.stderr);
+    assert_eq!(out.error()["kind"], "limit_exceeded");
+    assert!(
+        out.error()["message"]
+            .as_str()
+            .unwrap()
+            .contains("transcod"),
+        "{}",
+        out.stderr
+    );
+    none.assert();
+}
+
+#[test]
+fn a_playlist_changed_during_the_upload_is_not_overwritten() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let dir = book(env.tmp.path());
+    let _mine = server
+        .mock("GET", "/content/mine")
+        .with_body(json!({"cards": [{"cardId": "abc12", "title": "Boer Boris"}]}).to_string())
+        .create();
+    // The first read sees the stored card; later reads see a chapter that
+    // someone else renamed in the Yoto app while the audio was uploading.
+    let reads = Arc::new(Mutex::new(0));
+    let count = reads.clone();
+    let _card = server
+        .mock("GET", "/content/abc12")
+        .with_body_from_request(move |_| {
+            let mut n = count.lock().unwrap();
+            *n += 1;
+            let mut card = stored_card();
+            if *n > 1 {
+                card["content"]["chapters"][0]["title"] = json!("Elders hernoemd");
+            }
+            json!({"card": card}).to_string().into()
+        })
+        .create();
+    let _t1 = mock_track(
+        &mut server,
+        &sha256_hex(&dir.join("01 - Het begin.mp3")),
+        1,
+        false,
+    );
+    let _t2 = mock_track(
+        &mut server,
+        &sha256_hex(&dir.join("02 - Het einde.mp3")),
+        2,
+        false,
+    );
+    let none = server.mock("POST", "/content").expect(0).create();
+    let out = env.run(&[
+        "content",
+        "append",
+        "abc12",
+        dir.to_str().unwrap(),
+        "--no-icons",
+        "--yes",
+    ]);
+    assert_eq!(out.code, 13, "{}", out.stderr);
+    assert_eq!(out.error()["kind"], "conflict");
+    none.assert();
+    assert_eq!(*reads.lock().unwrap(), 2);
+}
+
+#[test]
+fn an_edit_that_changes_nothing_is_not_saved_and_keeps_the_stored_totals() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let mut card = stored_card();
+    // Totals as Yoto may store them: whole numbers, extra fields.
+    card["metadata"]["media"] = json!({"duration": 240, "fileSize": 4000, "hasStreams": false});
+    let _stored = mock_stored(&mut server, &card);
+
+    let none = server.mock("POST", "/content").expect(0).create();
+    let out = env.run(&["content", "edit", "abc12", "--author", "Ted", "--yes"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["changed"], false);
+    assert_eq!(out.json()["dry_run"], false);
+    let out = env.run(&["content", "edit", "abc12", "--author", "Ted", "--dry-run"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["changed"], false);
+    assert_eq!(out.json()["dry_run"], true);
+    none.assert();
+    none.remove();
+
+    let (create, seen) = mock_create(&mut server, json!({"cardId": "abc12"}), "abc12");
+    let out = env.run(&[
+        "content", "chapter", "rename", "abc12", "1", "Anders", "--yes",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    create.assert();
+    assert_eq!(
+        seen.lock().unwrap()[0]["metadata"]["media"],
+        card["metadata"]["media"]
+    );
+
+    // Deleting a chapter recounts the totals and keeps the other media fields.
+    let out = env.run(&["content", "chapter", "delete", "abc12", "1", "--yes"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let media = seen.lock().unwrap()[1]["metadata"]["media"].clone();
+    assert_eq!(media["hasStreams"], false);
+    assert_eq!(media["duration"], 180.0);
+    assert_eq!(media["fileSize"], 3000);
+}
+
+#[test]
+fn a_details_preview_shows_the_values_it_would_set() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let _stored = mock_stored(&mut server, &stored_card());
+    let none = server.mock("POST", "/content").expect(0).create();
+    let out = env.run(&[
+        "content",
+        "edit",
+        "abc12",
+        "--author",
+        "Annie M.G. Schmidt",
+        "--min-age",
+        "4",
+        "--language",
+        "nl",
+        "--dry-run",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let json = out.json();
+    assert_eq!(json["metadata"]["author"], "Annie M.G. Schmidt");
+    assert_eq!(json["metadata"]["minAge"], 4);
+    assert_eq!(json["metadata"]["languages"], json!(["nl"]));
+    let change = json["change"].as_str().unwrap();
+    assert!(change.contains("\"Annie M.G. Schmidt\""), "{change}");
+    assert!(change.contains("minAge to 4"), "{change}");
+    assert!(change.contains("nl"), "{change}");
+    let out = env.run(&[
+        "content",
+        "edit",
+        "abc12",
+        "--author",
+        "",
+        "--dry-run",
+        "-o",
+        "text",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("remove author"), "{}", out.stdout);
+    none.assert();
+}
+
+#[test]
+fn people_are_saved_as_the_lists_yoto_keeps() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let mut card = stored_card();
+    card["metadata"]["readBy"] = json!("Oud");
+    let stored = mock_stored(&mut server, &card);
+    let (create, seen) = mock_create(&mut server, json!({"cardId": "abc12"}), "abc12");
+    let out = env.run(&[
+        "content",
+        "edit",
+        "abc12",
+        "--read-by",
+        "Ruben",
+        "--author",
+        "",
+        "--yes",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    create.assert();
+    let sent = seen.lock().unwrap()[0]["metadata"].clone();
+    assert_eq!(sent["narrators"], json!(["Ruben"]));
+    assert_eq!(sent["authors"], json!([]));
+    assert!(sent.get("readBy").is_none(), "{sent}");
+    assert!(sent.get("author").is_none(), "{sent}");
+    let change = out.json()["change"].as_str().unwrap().to_string();
+    assert_eq!(change, r#"set narrators to ["Ruben"]; remove author"#);
+
+    // Re-running it against what Yoto then stores changes nothing.
+    for m in stored {
+        m.remove();
+    }
+    let mut saved = stored_card();
+    saved["metadata"]["narrators"] = json!(["Ruben"]);
+    saved["metadata"]["authors"] = json!([]);
+    saved["metadata"].as_object_mut().unwrap().remove("author");
+    let _stored = mock_stored(&mut server, &saved);
+    create.remove();
+    let none = server.mock("POST", "/content").expect(0).create();
+    let out = env.run(&[
+        "content",
+        "edit",
+        "abc12",
+        "--read-by",
+        "Ruben",
+        "--author",
+        "",
+        "--yes",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["changed"], false);
+    none.assert();
 }

@@ -49,8 +49,6 @@ pub fn run(
     opts: &Options,
     mut log: impl FnMut(String),
 ) -> Result<Value> {
-    assert_eq!(hashes.len(), plan.tracks.len(), "one hash per track");
-
     let cover_url = match (&plan.cover, opts.upload_cover) {
         (Some(path), true) => {
             let bytes = std::fs::read(path).map_err(|e| {
@@ -66,46 +64,7 @@ pub fn run(
     };
 
     let icon_refs = upload_icons(client, plan, &mut log)?;
-
-    let n = plan.tracks.len();
-    let mut done = Vec::with_capacity(n);
-    for (i, (track, sha)) in plan.tracks.iter().zip(hashes).enumerate() {
-        let filename = track
-            .path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let slot = client.upload_slot(sha, &filename)?;
-        let reused = slot.upload_url.is_none();
-        match &slot.upload_url {
-            Some(url) => {
-                log(format!(
-                    "[{}/{n}] uploading {} ({:.1} MB)",
-                    i + 1,
-                    track.title,
-                    track.bytes as f64 / 1e6
-                ));
-                client.put_audio(url, &track.path, track.format.content_type())?;
-            }
-            None => log(format!("[{}/{n}] already on Yoto: {}", i + 1, track.title)),
-        }
-        let transcoded = client.wait_transcoded(&slot.upload_id, opts.transcode_timeout)?;
-        if let Some(d) = transcoded.duration.filter(|d| *d > plan::MAX_TRACK_SECONDS) {
-            return Err(Error::LimitExceeded {
-                message: format!(
-                    "{} lasts {d:.0} s after transcoding; a track may last at most {:.0} s",
-                    track.title,
-                    plan::MAX_TRACK_SECONDS
-                ),
-            });
-        }
-        done.push(Uploaded {
-            title: track.title.clone(),
-            transcoded,
-            reused,
-            on_end: track.on_end,
-        });
-    }
+    let done = upload_tracks(client, plan, hashes, opts.transcode_timeout, &mut log)?;
 
     let chapters: Vec<ChapterBody> = plan
         .chapters
@@ -154,52 +113,116 @@ pub fn run(
     }))
 }
 
+/// Upload (or find on Yoto) every track of `plan` and wait for each to be
+/// transcoded, in order.
+pub fn upload_tracks(
+    client: &Client,
+    plan: &Plan,
+    hashes: &[String],
+    transcode_timeout: Duration,
+    log: &mut impl FnMut(String),
+) -> Result<Vec<Uploaded>> {
+    assert_eq!(hashes.len(), plan.tracks.len(), "one hash per track");
+    let n = plan.tracks.len();
+    let mut done = Vec::with_capacity(n);
+    for (i, (track, sha)) in plan.tracks.iter().zip(hashes).enumerate() {
+        let filename = track
+            .path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let slot = client.upload_slot(sha, &filename)?;
+        let reused = slot.upload_url.is_none();
+        match &slot.upload_url {
+            Some(url) => {
+                log(format!(
+                    "[{}/{n}] uploading {} ({:.1} MB)",
+                    i + 1,
+                    track.title,
+                    track.bytes as f64 / 1e6
+                ));
+                client.put_audio(url, &track.path, track.format.content_type())?;
+            }
+            None => log(format!("[{}/{n}] already on Yoto: {}", i + 1, track.title)),
+        }
+        let transcoded = client.wait_transcoded(&slot.upload_id, transcode_timeout)?;
+        if let Some(d) = transcoded.duration.filter(|d| *d > plan::MAX_TRACK_SECONDS) {
+            return Err(Error::LimitExceeded {
+                message: format!(
+                    "{} lasts {d:.0} s after transcoding; a track may last at most {:.0} s",
+                    track.title,
+                    plan::MAX_TRACK_SECONDS
+                ),
+            });
+        }
+        done.push(Uploaded {
+            title: track.title.clone(),
+            transcoded,
+            reused,
+            on_end: track.on_end,
+        });
+    }
+    Ok(done)
+}
+
 /// Resolve every chapter's icon to a `yoto:#` reference, uploading each
 /// distinct image file once.
-fn upload_icons(client: &Client, plan: &Plan, log: &mut impl FnMut(String)) -> Result<Vec<String>> {
-    let mut uploaded: BTreeMap<&Icon, String> = BTreeMap::new();
-    let mut refs = Vec::with_capacity(plan.chapters.len());
-    for number in 1..=plan.chapters.len() {
-        let reference = match plan.icons.for_chapter(number) {
-            None => DEFAULT_ICON.to_string(),
-            Some(Icon::Yoto(id)) => format!("yoto:#{id}"),
-            Some(icon @ Icon::File(path)) => match uploaded.get(icon) {
-                Some(r) => r.clone(),
-                None => {
-                    let bytes = std::fs::read(path).map_err(|e| {
-                        Error::invalid(format!("cannot read icon {}: {e}", path.display()))
-                    })?;
-                    let info = ImageInfo::sniff(&bytes).ok_or_else(|| {
-                        Error::invalid(format!(
-                            "icon {} is not a PNG, GIF or JPEG image",
-                            path.display()
-                        ))
-                    })?;
-                    let name = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "icon".into());
-                    log(format!(
-                        "icon: uploading {}{}",
-                        path.display(),
-                        if info.ready {
-                            ""
-                        } else {
-                            " (Yoto converts it to 16x16)"
-                        }
-                    ));
-                    let r = format!(
-                        "yoto:#{}",
-                        client.upload_icon(&bytes, &name, info.content_type, !info.ready)?
-                    );
-                    uploaded.insert(icon, r.clone());
-                    r
-                }
-            },
-        };
-        refs.push(reference);
+pub fn upload_icons(
+    client: &Client,
+    plan: &Plan,
+    log: &mut impl FnMut(String),
+) -> Result<Vec<String>> {
+    let mut uploaded: BTreeMap<Icon, String> = BTreeMap::new();
+    (1..=plan.chapters.len())
+        .map(|number| match plan.icons.for_chapter(number) {
+            None => Ok(DEFAULT_ICON.to_string()),
+            Some(icon) => resolve_icon(client, icon, &mut uploaded, log),
+        })
+        .collect()
+}
+
+/// The `yoto:#` reference for `icon`, uploading an image file unless
+/// `uploaded` already holds its reference.
+pub fn resolve_icon(
+    client: &Client,
+    icon: &Icon,
+    uploaded: &mut BTreeMap<Icon, String>,
+    log: &mut impl FnMut(String),
+) -> Result<String> {
+    let path = match icon {
+        Icon::Yoto(id) => return Ok(format!("yoto:#{id}")),
+        Icon::File(path) => path,
+    };
+    if let Some(r) = uploaded.get(icon) {
+        return Ok(r.clone());
     }
-    Ok(refs)
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::invalid(format!("cannot read icon {}: {e}", path.display())))?;
+    let info = ImageInfo::sniff(&bytes).ok_or_else(|| {
+        Error::invalid(format!(
+            "icon {} is not a PNG, GIF or JPEG image",
+            path.display()
+        ))
+    })?;
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "icon".into());
+    log(format!(
+        "icon: uploading {}{}",
+        path.display(),
+        if info.ready {
+            ""
+        } else {
+            " (Yoto converts it to 16x16)"
+        }
+    ));
+    let r = format!(
+        "yoto:#{}",
+        client.upload_icon(&bytes, &name, info.content_type, !info.ready)?
+    );
+    uploaded.insert(icon.clone(), r.clone());
+    Ok(r)
 }
 
 /// The `POST /content` body. Chapters are numbered from 1, so the player's

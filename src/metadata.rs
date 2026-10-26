@@ -37,6 +37,18 @@ impl Category {
 /// The oldest age the range accepts; ages are whole years.
 pub const MAX_AGE: u8 = 99;
 
+/// The card `metadata` fields that `Metadata` sets.
+pub const FIELDS: [&str; 8] = [
+    "author",
+    "authors",
+    "narrators",
+    "description",
+    "category",
+    "minAge",
+    "maxAge",
+    "languages",
+];
+
 /// Fields to set. `None` leaves a field as it is; an empty string removes it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Metadata {
@@ -77,20 +89,41 @@ impl Metadata {
     /// Write the chosen fields into a card's `metadata` object, then check
     /// the age range as it ends up, so an edit cannot leave min above max.
     pub fn apply(&self, metadata: &mut Map<String, Value>) -> Result<()> {
-        let text = [
-            ("author", &self.author),
-            ("readBy", &self.read_by),
-            ("description", &self.description),
-        ];
-        for (field, value) in text {
-            match value.as_deref().map(str::trim) {
-                None => {}
-                Some("") => {
-                    metadata.remove(field);
-                }
-                Some(v) => {
-                    metadata.insert(field.into(), json!(v));
-                }
+        // Yoto keeps the people in `authors` and `narrators`. It derives
+        // `author` from the first author, and drops a `readBy` beside
+        // `narrators`, so a legacy `readBy` goes when the narrator is set.
+        // Removing empties a list Yoto keeps and adds none it does not.
+        let empty = |metadata: &mut Map<String, Value>, list: &str| {
+            if metadata.contains_key(list) {
+                metadata.insert(list.into(), json!([]));
+            }
+        };
+        match self.author.as_deref().map(str::trim) {
+            None => {}
+            Some("") => {
+                metadata.remove("author");
+                empty(metadata, "authors");
+            }
+            Some(v) => {
+                metadata.insert("author".into(), json!(v));
+                metadata.insert("authors".into(), json!([v]));
+            }
+        }
+        if let Some(v) = self.read_by.as_deref().map(str::trim) {
+            metadata.remove("readBy");
+            if v.is_empty() {
+                empty(metadata, "narrators");
+            } else {
+                metadata.insert("narrators".into(), json!([v]));
+            }
+        }
+        match self.description.as_deref().map(str::trim) {
+            None => {}
+            Some("") => {
+                metadata.remove("description");
+            }
+            Some(v) => {
+                metadata.insert("description".into(), json!(v));
             }
         }
         if let Some(c) = self.category {
@@ -165,12 +198,19 @@ mod tests {
             language: Some("nl".into()),
             ..Metadata::default()
         };
-        let out = apply(&m, json!({"description": "oud", "media": {"duration": 5}})).unwrap();
+        let out = apply(
+            &m,
+            json!({"description": "oud", "readBy": "oud", "media": {"duration": 5}}),
+        )
+        .unwrap();
+        // Yoto keeps people in `authors` and `narrators` and derives `author`
+        // from the first; a `readBy` it does not store is dropped.
         assert_eq!(
             out,
             json!({
                 "author": "Ted van Lieshout",
-                "readBy": "Ruben",
+                "authors": ["Ted van Lieshout"],
+                "narrators": ["Ruben"],
                 "description": "oud",
                 "category": "stories",
                 "minAge": 2,
@@ -185,16 +225,34 @@ mod tests {
     fn an_empty_value_removes_the_field() {
         let m = Metadata {
             author: Some(String::new()),
+            read_by: Some(String::new()),
             description: Some("  ".into()),
             language: Some(String::new()),
             ..Metadata::default()
         };
         let out = apply(
             &m,
-            json!({"author": "a", "description": "d", "languages": ["nl"], "readBy": "r"}),
+            json!({
+                "author": "a", "authors": ["a", "b"], "narrators": ["r"], "readBy": "r",
+                "description": "d", "languages": ["nl"], "category": "stories"
+            }),
         )
         .unwrap();
-        assert_eq!(out, json!({"readBy": "r"}));
+        assert_eq!(
+            out,
+            json!({"authors": [], "narrators": [], "category": "stories"})
+        );
+    }
+
+    #[test]
+    fn removing_a_person_that_is_not_there_changes_nothing() {
+        let m = Metadata {
+            author: Some(String::new()),
+            read_by: Some(String::new()),
+            ..Metadata::default()
+        };
+        let start = json!({"category": "stories"});
+        assert_eq!(apply(&m, start.clone()).unwrap(), start);
     }
 
     #[test]

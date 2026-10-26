@@ -18,13 +18,46 @@ fn metadata_args() -> Vec<Value> {
         json!({"name": "--read-by", "type": "string", "description": "Narrator; \"\" removes it."}),
         json!({"name": "--description", "type": "string", "description": "Description; \"\" removes it."}),
         json!({"name": "--category", "type": "string", "enum": ["none", "stories", "music", "radio", "podcast", "sfx", "activities", "alarms"], "description": "Yoto category."}),
-        json!({"name": "--min-age", "type": "integer", "description": "Youngest age in years, 0 to 99; may not exceed the maximum age."}),
-        json!({"name": "--max-age", "type": "integer", "description": "Oldest age in years, 0 to 99."}),
+        json!({"name": "--min-age", "type": "integer", "minimum": 0, "maximum": 99, "description": "Youngest age in years, 0 to 99; may not exceed the maximum age."}),
+        json!({"name": "--max-age", "type": "integer", "minimum": 0, "maximum": 99, "description": "Oldest age in years, 0 to 99."}),
         json!({"name": "--language", "type": "string", "description": "BCP 47 language tag such as nl or en-GB; \"\" removes it."}),
     ]
 }
 
 /// `args` followed by the metadata flags.
+/// What every playlist change reports.
+fn edit_output_fields() -> Value {
+    json!([
+        {"name": "card_id", "type": "string"},
+        {"name": "title", "type": "string"},
+        {"name": "change", "type": "string", "description": "What the command changes, in words."},
+        {"name": "dry_run", "type": "boolean"},
+        {"name": "changed", "type": "boolean", "description": "Whether the playlist was saved; false with --dry-run or when nothing differed."},
+        {"name": "chapter_count", "type": "integer"},
+        {"name": "track_count", "type": "integer"},
+        {"name": "duration_seconds", "type": "number", "nullable": true},
+        {"name": "metadata", "type": "object", "description": "The playlist details after the change (with --dry-run: as they would be), under their Yoto names (author, authors, narrators, description, category, minAge, maxAge, languages; --read-by sets narrators); a detail that is not set is absent."},
+        {"name": "chapters", "type": "array", "description": "The chapters after the change (with --dry-run: as they would be).", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "key", "type": "string", "nullable": true}, {"name": "title", "type": "string", "nullable": true}, {"name": "track_count", "type": "integer"}, {"name": "icon", "type": "string", "nullable": true}]}}
+    ])
+}
+
+/// The card ID, then `args`, then the confirmation flags.
+fn chapter_args(args: Value) -> Value {
+    let mut all = vec![
+        json!({"name": "card_id", "type": "string", "required": true, "description": "Card ID from `content list`."}),
+    ];
+    all.extend(args.as_array().cloned().unwrap_or_default());
+    all.push(json!({"name": "--dry-run", "type": "boolean", "default": false, "description": "Show the result without saving."}));
+    all.push(json!({"name": "--yes", "type": "boolean", "default": false, "description": "Confirm the change."}));
+    Value::Array(all)
+}
+
+fn with_fields(fields: Value, more: Value) -> Value {
+    let mut all = fields.as_array().cloned().unwrap_or_default();
+    all.extend(more.as_array().cloned().unwrap_or_default());
+    Value::Array(all)
+}
+
 fn with_metadata_args(args: Value) -> Value {
     let mut all = args.as_array().cloned().unwrap_or_default();
     all.extend(metadata_args());
@@ -140,7 +173,7 @@ pub fn contract() -> Value {
                     {"name": "updated_at", "type": "string", "nullable": true},
                     {"name": "duration_seconds", "type": "number", "nullable": true},
                     {"name": "cover_url", "type": "string", "nullable": true},
-                    {"name": "chapters", "type": "array", "items": {"type": "object", "fields": [{"name": "key", "type": "string"}, {"name": "title", "type": "string"}, {"name": "icon", "type": "string", "nullable": true, "description": "The chapter's 16x16 icon as a yoto:#<mediaId> reference; null when the playlist sets none."}, {"name": "tracks", "type": "array", "items": {"type": "object", "fields": [{"name": "key", "type": "string"}, {"name": "title", "type": "string"}, {"name": "duration_seconds", "type": "number", "nullable": true}, {"name": "format", "type": "string", "nullable": true}, {"name": "type", "type": "string", "nullable": true}]}}]}}
+                    {"name": "chapters", "type": "array", "items": {"type": "object", "fields": [{"name": "number", "type": "integer", "description": "1-based position; the number the chapter commands take."}, {"name": "key", "type": "string"}, {"name": "title", "type": "string"}, {"name": "icon", "type": "string", "nullable": true, "description": "The chapter's 16x16 icon as a yoto:#<mediaId> reference; null when the playlist sets none."}, {"name": "tracks", "type": "array", "items": {"type": "object", "fields": [{"name": "key", "type": "string"}, {"name": "title", "type": "string"}, {"name": "duration_seconds", "type": "number", "nullable": true}, {"name": "format", "type": "string", "nullable": true}, {"name": "type", "type": "string", "nullable": true}]}}]}}
                 ]
             },
             {
@@ -160,6 +193,103 @@ pub fn contract() -> Value {
                     {"name": "title", "type": "string"},
                     {"name": "deleted", "type": "boolean"}
                 ]
+            },
+            {
+                "name": "content edit",
+                "description": "Change a playlist's title (--title) or its details (--author, --read-by, --description, --category, --min-age, --max-age, --language; \"\" removes a text detail). The playlist is fetched, changed and saved under the same card ID, so cards linked to it keep working and its chapters are untouched. Needs at least one change; a change that leaves the playlist as it was saves nothing (changed false). Needs --yes unless --dry-run. Fails with not_found unless the playlist is one of yours.",
+                "effects": "idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "stability": "beta",
+                "confirmation_bypass_arg": "--yes",
+                "args": with_metadata_args(json!([
+                    {"name": "card_id", "type": "string", "required": true, "description": "Card ID from `content list`."},
+                    {"name": "--title", "type": "string", "description": "New playlist title, 1 to 140 characters."},
+                    {"name": "--dry-run", "type": "boolean", "default": false, "description": "Show the result without saving."},
+                    {"name": "--yes", "type": "boolean", "default": false, "description": "Confirm the change."}
+                ])),
+                "output_fields": edit_output_fields()
+            },
+            {
+                "name": "content append",
+                "description": "Add the audio of a folder, read as `upload` reads it (each file a chapter, each subfolder one chapter), as new chapters after the existing ones. Existing chapters keep their keys, so a player's place in them is kept, and the card ID stays the same. The playlist's total may not pass 100 tracks. An icons.json in the folder itself (not in its parent) numbers the new chapters from 1. Running it twice appends the chapters twice. Needs --yes unless --dry-run; progress goes to stderr.",
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "stability": "beta",
+                "confirmation_bypass_arg": "--yes",
+                "args": [
+                    {"name": "card_id", "type": "string", "required": true, "description": "Card ID from `content list`."},
+                    {"name": "dir", "type": "path", "required": true, "description": "Folder of audio files."},
+                    {"name": "--icons", "type": "path", "description": "icons.json to use instead of the detected one; numbers count the new chapters from 1."},
+                    {"name": "--icon", "type": "string", "description": "Icon for every new chapter the icons.json does not name: an image path or yoto:#<mediaId>."},
+                    {"name": "--no-icons", "type": "boolean", "default": false, "description": "Ignore any icons.json."},
+                    {"name": "--dry-run", "type": "boolean", "default": false, "description": "Show the new chapters without uploading."},
+                    {"name": "--yes", "type": "boolean", "default": false, "description": "Confirm the change."},
+                    {"name": "--transcode-timeout", "type": "integer", "default": 600, "description": "Seconds to wait for Yoto to transcode each track."}
+                ],
+                "output_fields": with_fields(edit_output_fields(), json!([
+                    {"name": "new_chapters", "type": "array", "description": "Only with --dry-run: the chapters that would be added, numbered as in the playlist.", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "title", "type": "string"}, {"name": "track_count", "type": "integer"}, {"name": "icon", "type": "string", "nullable": true}]}},
+                    {"name": "new_tracks", "type": "array", "description": "Only with --dry-run: the tracks that would be added, with `chapter` numbered as in the playlist.", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "chapter", "type": "integer"}, {"name": "title", "type": "string"}, {"name": "file", "type": "string"}, {"name": "bytes", "type": "integer"}, {"name": "format", "type": "string", "enum": ["mp3", "m4a", "wav", "flac", "ogg"]}, {"name": "duration_seconds", "type": "number", "nullable": true}, {"name": "on_end", "type": "string", "nullable": true, "enum": ["stop", "repeat"]}, {"name": "icon", "type": "string", "nullable": true, "description": "The chapter's icon."}]}},
+                    {"name": "ignored", "type": "array", "items": {"type": "string"}, "description": "Only with --dry-run: files that are not audio."},
+                    {"name": "uploaded", "type": "integer", "description": "Not with --dry-run: tracks uploaded."},
+                    {"name": "reused", "type": "integer", "description": "Not with --dry-run: tracks Yoto already had."}
+                ]))
+            },
+            {
+                "name": "content chapter rename",
+                "description": "Rename a chapter, and its track when the chapter has exactly one. Same card ID; needs --yes unless --dry-run.",
+                "effects": "idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "stability": "beta",
+                "confirmation_bypass_arg": "--yes",
+                "args": chapter_args(json!([
+                    {"name": "number", "type": "integer", "required": true, "description": "Chapter number from `content show` (1-based)."},
+                    {"name": "title", "type": "string", "required": true, "description": "New title, 1 to 140 characters."}
+                ])),
+                "output_fields": edit_output_fields()
+            },
+            {
+                "name": "content chapter delete",
+                "description": "Delete one or more chapters with their tracks. The remaining chapters keep their keys; number labels shown on the player follow the new positions. At least one chapter must remain (delete the playlist instead). Not idempotent: numbers refer to the current order. Needs --yes unless --dry-run.",
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "stability": "beta",
+                "confirmation_bypass_arg": "--yes",
+                "args": chapter_args(json!([
+                    {"name": "numbers", "type": "integer[]", "required": true, "description": "Chapter numbers from `content show` (1-based)."}
+                ])),
+                "output_fields": edit_output_fields()
+            },
+            {
+                "name": "content chapter move",
+                "description": "Move a chapter so it becomes chapter TO; the others shift. Keys stay; number labels follow the new positions, other labels stay. Not idempotent. Needs --yes unless --dry-run.",
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "stability": "beta",
+                "confirmation_bypass_arg": "--yes",
+                "args": chapter_args(json!([
+                    {"name": "from", "type": "integer", "required": true, "description": "Chapter number to move."},
+                    {"name": "to", "type": "integer", "required": true, "description": "Position it moves to."}
+                ])),
+                "output_fields": edit_output_fields()
+            },
+            {
+                "name": "content chapter icon",
+                "description": "Set the 16x16 icon shown while a chapter plays, on the chapter and each of its tracks: a yoto:#<mediaId> from `icons list`, or a PNG, GIF or JPEG file that is uploaded as one of your icons (only after confirmation). Needs --yes unless --dry-run.",
+                "effects": "idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "stability": "beta",
+                "confirmation_bypass_arg": "--yes",
+                "args": chapter_args(json!([
+                    {"name": "number", "type": "integer", "required": true, "description": "Chapter number from `content show` (1-based)."},
+                    {"name": "icon", "type": "string", "required": true, "description": "yoto:#<mediaId> or an image path."}
+                ])),
+                "output_fields": edit_output_fields()
             },
             {
                 "name": "icons list",
@@ -220,9 +350,9 @@ pub fn contract() -> Value {
                     {"name": "icons_file", "type": "string", "nullable": true, "description": "Only with --dry-run: the icons.json used."},
                     {"name": "dry_run", "type": "boolean", "description": "Only with --dry-run."},
                     {"name": "chapters", "type": "array", "description": "Only with --dry-run.", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "title", "type": "string"}, {"name": "track_count", "type": "integer"}, {"name": "icon", "type": "string", "nullable": true, "description": "Image path or yoto:# reference; null for the default icon."}]}},
-                    {"name": "metadata", "type": "object", "description": "Only with --dry-run: the playlist details that would be set, under their Yoto names (author, readBy, description, category, minAge, maxAge, languages)."},
+                    {"name": "metadata", "type": "object", "description": "Only with --dry-run: the playlist details that would be set, under their Yoto names (author, authors, narrators, description, category, minAge, maxAge, languages; --read-by sets narrators)."},
                     {"name": "tracks", "type": "array", "description": "Only with --dry-run.", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "chapter", "type": "integer", "description": "Number of the chapter holding the track."}, {"name": "title", "type": "string"}, {"name": "file", "type": "string"}, {"name": "bytes", "type": "integer"}, {"name": "format", "type": "string", "enum": ["mp3", "m4a", "wav", "flac", "ogg"]}, {"name": "duration_seconds", "type": "number", "nullable": true}, {"name": "on_end", "type": "string", "nullable": true, "enum": ["stop", "repeat"]}, {"name": "icon", "type": "string", "nullable": true, "description": "The chapter's icon."}]}},
-                    {"name": "ignored", "type": "array", "items": {"type": "string"}, "description": "Only with --dry-run: files in the folder (or a subfolder, as `sub/name`) that are not uploaded."}
+                    {"name": "ignored", "type": "array", "items": {"type": "string"}, "description": "Only with --dry-run: files in the folder (or a subfolder, as `sub/name`) that are not uploaded, and folders nested deeper than one level (as `sub/deeper/`)."}
                 ]
             },
             {
@@ -251,14 +381,15 @@ pub fn contract() -> Value {
             {"kind": "invalid_input", "exit_code": 1, "retryable": false, "description": "A local input is missing or unusable: folder, manifest, audio in no supported format, a playlist detail out of range, a size or SHA-256 that does not match the manifest, or a bad cover, icon or icons.json."},
             {"kind": "usage", "exit_code": 3, "retryable": false, "description": "Invalid command-line arguments, a missing client ID, or a manifest book needing --playlist."},
             {"kind": "not_authenticated", "exit_code": 4, "retryable": false, "description": "Not signed in, or the sign-in was rejected or can no longer be refreshed."},
-            {"kind": "confirmation_required", "exit_code": 5, "retryable": false, "description": "A mutating command was run without --yes. Nothing was changed."},
+            {"kind": "confirmation_required", "exit_code": 5, "retryable": false, "description": "A mutating command was run without --yes. Nothing was changed. A playlist change that would leave the playlist as it was needs no --yes: it succeeds with changed false."},
             {"kind": "limit_exceeded", "exit_code": 6, "retryable": false, "description": "The playlist breaks a Yoto limit."},
-            {"kind": "not_found", "exit_code": 7, "retryable": false, "description": "The playlist (from content show/delete or upload --replace) does not exist or is not yours."},
+            {"kind": "not_found", "exit_code": 7, "retryable": false, "description": "The playlist (from content show/delete/edit/append, content chapter or upload --replace) does not exist or is not yours."},
             {"kind": "api_error", "exit_code": 8, "retryable": false, "description": "The Yoto API returned an error or an unexpected response."},
             {"kind": "network", "exit_code": 9, "retryable": true, "description": "No HTTP answer (DNS, TLS, connection, timeout)."},
             {"kind": "transcode_timeout", "exit_code": 10, "retryable": true, "description": "Yoto did not finish transcoding a track in time. Re-running reuses what was already uploaded."},
             {"kind": "auth_failed", "exit_code": 11, "retryable": false, "description": "The browser sign-in did not complete: refused, wrong state, timed out, port busy, or the code exchange was rejected."},
-            {"kind": "token_store", "exit_code": 12, "retryable": false, "description": "Reading or writing the keychain, token file or config failed. On Linux the keychain is the Secret Service; without one, set YOTO_CLI_TOKEN_FILE."}
+            {"kind": "token_store", "exit_code": 12, "retryable": false, "description": "Reading or writing the keychain, token file or config failed. On Linux the keychain is the Secret Service; without one, set YOTO_CLI_TOKEN_FILE."},
+            {"kind": "conflict", "exit_code": 13, "retryable": true, "description": "The playlist changed (in the Yoto app or another command) while an edit was being prepared. Nothing was saved; re-running applies the edit to the current playlist."}
         ]
     })
 }
@@ -291,6 +422,7 @@ mod tests {
             Error::Network { message: m() },
             Error::TranscodeTimeout { message: m() },
             Error::TokenStore { message: m() },
+            Error::Conflict { message: m() },
         ]
     }
 

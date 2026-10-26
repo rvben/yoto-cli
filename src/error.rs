@@ -52,6 +52,10 @@ pub enum Error {
     /// Reading or writing the stored sign-in (keychain or token file) failed.
     #[error("{message}")]
     TokenStore { message: String },
+
+    /// The playlist changed between reading it and saving the edit.
+    #[error("{message}")]
+    Conflict { message: String },
 }
 
 impl Error {
@@ -69,6 +73,7 @@ impl Error {
             Error::Network { .. } => "network",
             Error::TranscodeTimeout { .. } => "transcode_timeout",
             Error::TokenStore { .. } => "token_store",
+            Error::Conflict { .. } => "conflict",
         }
     }
 
@@ -94,6 +99,9 @@ impl Error {
             Error::TokenStore { .. } => Some(
                 "on a host without a usable keychain (no Secret Service on Linux), set YOTO_CLI_TOKEN_FILE to keep the sign-in in a 0600 file",
             ),
+            Error::Conflict { .. } => Some(
+                "re-run the command to apply it to the current playlist; audio already uploaded is not uploaded again",
+            ),
         }
     }
 
@@ -111,6 +119,7 @@ impl Error {
             Error::TranscodeTimeout { .. } => 10,
             Error::AuthFailed { .. } => 11,
             Error::TokenStore { .. } => 12,
+            Error::Conflict { .. } => 13,
         }
     }
 
