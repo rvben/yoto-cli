@@ -368,8 +368,19 @@ fn icons_list_filters_on_every_word() {
 }
 
 /// Mocks for one track: an upload slot (with or without a PUT URL) and a
-/// finished transcode.
+/// finished transcode of `1000 * n` bytes.
 fn mock_track(server: &mut Server, sha: &str, n: usize, needs_upload: bool) -> Vec<mockito::Mock> {
+    mock_track_of(server, sha, n, needs_upload, 1000 * n as u64)
+}
+
+/// `mock_track` with the transcoded size Yoto reports.
+fn mock_track_of(
+    server: &mut Server,
+    sha: &str,
+    n: usize,
+    needs_upload: bool,
+    bytes: u64,
+) -> Vec<mockito::Mock> {
     let upload_url = needs_upload.then(|| format!("{}/put/{n}", server.url()));
     let mut mocks = vec![
         server
@@ -382,7 +393,7 @@ fn mock_track(server: &mut Server, sha: &str, n: usize, needs_upload: bool) -> V
             .mock("GET", format!("/media/upload/up{n}/transcoded").as_str())
             .match_query(Matcher::Any)
             .with_body(
-                json!({"transcode": {"transcodedSha256": format!("t{n}"), "transcodedInfo": {"duration": 60.0 * n as f64, "fileSize": 1000 * n, "channels": "stereo", "format": "aac"}}})
+                json!({"transcode": {"transcodedSha256": format!("t{n}"), "transcodedInfo": {"duration": 60.0 * n as f64, "fileSize": bytes, "channels": "stereo", "format": "aac"}}})
                     .to_string(),
             )
             .expect(1)
@@ -1566,6 +1577,49 @@ fn the_size_limit_is_checked_again_on_the_transcoded_audio() {
             .as_str()
             .unwrap()
             .contains("transcod"),
+        "{}",
+        out.stderr
+    );
+    none.assert();
+}
+
+#[test]
+fn an_upload_checks_the_size_limit_on_the_transcoded_audio() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let dir = book(env.tmp.path());
+    // The 38-byte sources fit; the 250 MB and 250.001 MB Yoto reports once
+    // they are transcoded are 1 kB over the limit together.
+    let _t1 = mock_track_of(
+        &mut server,
+        &sha256_hex(&dir.join("01 - Het begin.mp3")),
+        1,
+        false,
+        250_000_000,
+    );
+    let _t2 = mock_track_of(
+        &mut server,
+        &sha256_hex(&dir.join("02 - Het einde.mp3")),
+        2,
+        false,
+        250_001_000,
+    );
+    let none = server.mock("POST", "/content").expect(0).create();
+    let out = env.run(&[
+        "upload",
+        "--no-icons",
+        "--no-cover",
+        "--yes",
+        dir.to_str().unwrap(),
+    ]);
+    assert_eq!(out.code, 6, "{}", out.stderr);
+    assert_eq!(out.error()["kind"], "limit_exceeded");
+    assert!(
+        out.error()["message"]
+            .as_str()
+            .unwrap()
+            .contains("once transcoded the playlist would hold 500001000 bytes"),
         "{}",
         out.stderr
     );
