@@ -389,7 +389,7 @@ pub fn contract() -> Value {
             {"kind": "transcode_timeout", "exit_code": 10, "retryable": true, "description": "Yoto did not finish transcoding a track in time. Re-running reuses what was already uploaded."},
             {"kind": "auth_failed", "exit_code": 11, "retryable": false, "description": "The browser sign-in did not complete: refused, wrong state, timed out, port busy, or the code exchange was rejected."},
             {"kind": "token_store", "exit_code": 12, "retryable": false, "description": "Reading or writing the keychain, token file or config failed. On Linux the keychain is the Secret Service; without one, set YOTO_CLI_TOKEN_FILE."},
-            {"kind": "conflict", "exit_code": 13, "retryable": true, "description": "The playlist changed (in the Yoto app or another command) while an edit was being prepared. Nothing was saved; re-running applies the edit to the current playlist."},
+            {"kind": "conflict", "exit_code": 13, "retryable": true, "description": "The playlist changed (in the Yoto app or another command) while an edit was being prepared. Nothing was saved; re-running applies the edit to the current playlist. The playlist is read again just before saving; Yoto has no conditional save, so a change landing between that read and the save cannot be detected and is overwritten."},
             {"kind": "transcode_failed", "exit_code": 14, "retryable": false, "description": "Yoto reported that it could not transcode a track, usually because it cannot read the file. The message names the file and Yoto's reason. Nothing was saved."}
         ]
     })

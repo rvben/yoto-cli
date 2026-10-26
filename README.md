@@ -174,6 +174,11 @@ new position. `append` reads a folder the way `upload` does and checks the
 `icons.json` in the appended folder itself is used, numbering the new chapters
 from 1; one in the book folder belongs to the book's own chapters.
 
+Just before saving, an edit reads the playlist again and stops with a
+`conflict` if it changed in the meantime, for example in the Yoto app during
+a long `append`. Yoto has no conditional save, so a change made in the moment
+between that read and the save is not detected and is overwritten.
+
 ## Other commands
 
 ```sh
