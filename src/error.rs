@@ -56,6 +56,10 @@ pub enum Error {
     /// The playlist changed between reading it and saving the edit.
     #[error("{message}")]
     Conflict { message: String },
+
+    /// Yoto gave up transcoding an upload, usually because it cannot read the file.
+    #[error("{message}")]
+    TranscodeFailed { message: String },
 }
 
 impl Error {
@@ -74,6 +78,7 @@ impl Error {
             Error::TranscodeTimeout { .. } => "transcode_timeout",
             Error::TokenStore { .. } => "token_store",
             Error::Conflict { .. } => "conflict",
+            Error::TranscodeFailed { .. } => "transcode_failed",
         }
     }
 
@@ -102,6 +107,9 @@ impl Error {
             Error::Conflict { .. } => Some(
                 "re-run the command to apply it to the current playlist; audio already uploaded is not uploaded again",
             ),
+            Error::TranscodeFailed { .. } => Some(
+                "Yoto cannot read this file; convert it to MP3, M4A, WAV or FLAC and upload again",
+            ),
         }
     }
 
@@ -120,6 +128,7 @@ impl Error {
             Error::AuthFailed { .. } => 11,
             Error::TokenStore { .. } => 12,
             Error::Conflict { .. } => 13,
+            Error::TranscodeFailed { .. } => 14,
         }
     }
 

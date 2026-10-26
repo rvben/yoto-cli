@@ -206,6 +206,7 @@ yoto-cli completions zsh > _yoto-cli
 | `11` | `auth_failed` | the browser sign-in did not complete |
 | `12` | `token_store` | the keychain, token file or config could not be read or written |
 | `13` | `conflict` | the playlist changed while an edit was being prepared; nothing was saved (retryable) |
+| `14` | `transcode_failed` | Yoto could not transcode a track (it names the file and the reason); nothing was saved |
 
 ## For agents (clispec)
 

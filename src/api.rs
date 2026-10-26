@@ -398,7 +398,7 @@ impl Client {
                     match resp.text() {
                         Ok(text) => {
                             let body = json_body(status, &text, "checking the transcode")?;
-                            if let Some(t) = parse_transcoded(&body) {
+                            if let Some(t) = parse_transcoded(&body)? {
                                 return Ok(t);
                             }
                             last_failure = None;
@@ -489,20 +489,46 @@ impl Client {
     }
 }
 
-fn parse_transcoded(body: &Value) -> Option<Transcoded> {
-    let t = body.get("transcode")?;
+/// The finished transcode, `None` while Yoto is still working on it, or an
+/// error once Yoto reports that it gave up on the file.
+fn parse_transcoded(body: &Value) -> Result<Option<Transcoded>> {
+    let Some(t) = body.get("transcode") else {
+        return Ok(None);
+    };
     let sha256 = t
-        .get("transcodedSha256")?
-        .as_str()
-        .filter(|s| !s.is_empty())?;
+        .get("transcodedSha256")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let Some(sha256) = sha256 else {
+        return match transcode_failure(t) {
+            Some(message) => Err(Error::TranscodeFailed { message }),
+            None => Ok(None),
+        };
+    };
     let info = t.get("transcodedInfo");
     let field = |name: &str| info.and_then(|i| i.get(name));
-    Some(Transcoded {
+    Ok(Some(Transcoded {
         sha256: sha256.to_string(),
         duration: field("duration").and_then(Value::as_f64),
         file_size: field("fileSize").and_then(Value::as_u64),
         channels: field("channels").filter(|v| !v.is_null()).cloned(),
         format: field("format").and_then(Value::as_str).map(str::to_string),
+    }))
+}
+
+/// Why Yoto gave up on a transcode, when its `error` or `erroredAt` says it did.
+fn transcode_failure(t: &Value) -> Option<String> {
+    let error = t.get("error").filter(|e| !e.is_null());
+    let errored = t.get("erroredAt").is_some_and(|e| !e.is_null());
+    if error.is_none() && !errored {
+        return None;
+    }
+    let reason = error
+        .and_then(|e| e.get("message").and_then(Value::as_str).or(e.as_str()))
+        .unwrap_or("no reason given");
+    Some(match t.get("uploadFilename").and_then(Value::as_str) {
+        Some(name) => format!("Yoto could not transcode {name}: {reason}"),
+        None => format!("Yoto could not transcode the upload: {reason}"),
     })
 }
 
@@ -591,21 +617,51 @@ mod tests {
 
     #[test]
     fn transcoded_requires_a_sha() {
-        assert_eq!(parse_transcoded(&json!({"transcode": {}})), None);
+        assert_eq!(parse_transcoded(&json!({"transcode": {}})).unwrap(), None);
         assert_eq!(
-            parse_transcoded(&json!({"transcode": {"transcodedSha256": ""}})),
+            parse_transcoded(&json!({"transcode": {"transcodedSha256": ""}})).unwrap(),
+            None
+        );
+        // A transcode still in progress carries its failure fields as null.
+        assert_eq!(
+            parse_transcoded(&json!({"transcode": {
+                "transcodedSha256": null, "error": null, "erroredAt": null
+            }}))
+            .unwrap(),
             None
         );
         let t = parse_transcoded(&json!({"transcode": {
             "transcodedSha256": "abc",
             "transcodedInfo": {"duration": 12.5, "fileSize": 100, "channels": "stereo", "format": "mp3"}
         }}))
+        .unwrap()
         .unwrap();
         assert_eq!(t.sha256, "abc");
         assert_eq!(t.duration, Some(12.5));
         assert_eq!(t.file_size, Some(100));
         assert_eq!(t.channels, Some(json!("stereo")));
         assert_eq!(t.format.as_deref(), Some("mp3"));
+    }
+
+    #[test]
+    fn a_failure_is_reported_from_either_field_with_a_fallback_reason() {
+        let only_errored_at = parse_transcoded(&json!({"transcode": {
+            "transcodedSha256": null, "error": null, "erroredAt": "2026-10-26T08:31:34.813Z"
+        }}))
+        .unwrap_err();
+        assert_eq!(only_errored_at.kind(), "transcode_failed");
+        assert_eq!(
+            only_errored_at.to_string(),
+            "Yoto could not transcode the upload: no reason given"
+        );
+        let only_error = parse_transcoded(&json!({"transcode": {
+            "uploadFilename": "a.wav", "error": {"message": "bad header"}
+        }}))
+        .unwrap_err();
+        assert_eq!(
+            only_error.to_string(),
+            "Yoto could not transcode a.wav: bad header"
+        );
     }
 
     #[test]
@@ -680,6 +736,38 @@ mod tests {
         client.poll_interval = Duration::from_millis(50);
         client.retry_base = Duration::from_millis(10);
         client
+    }
+
+    #[test]
+    fn a_transcode_yoto_reports_as_failed_ends_the_wait_with_its_reason() {
+        let mut server = mockito::Server::new();
+        // The shape Yoto returns for a file its transcoder cannot read.
+        let failed = server
+            .mock("GET", "/media/upload/u1/transcoded")
+            .match_query(mockito::Matcher::Any)
+            .with_status(202)
+            .with_body(
+                json!({"transcode": {
+                    "uploadId": "u1",
+                    "uploadFilename": "05 - AIFF.aiff",
+                    "error": {"name": "TranscodeError", "message": "file is not a valid audio/video file"},
+                    "erroredAt": "2026-10-26T08:31:34.813Z",
+                    "transcodedAt": null,
+                    "transcodedSha256": null
+                }})
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+        let started = Instant::now();
+        let err = fast_client(&server.url())
+            .wait_transcoded("u1", Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(err.kind(), "transcode_failed", "{err}");
+        assert!(err.to_string().contains("05 - AIFF.aiff"), "{err}");
+        assert!(err.to_string().contains("not a valid audio"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        failed.assert();
     }
 
     #[test]
