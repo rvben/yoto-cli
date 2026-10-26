@@ -409,7 +409,7 @@ mod tests {
     fn metadata_goes_into_the_body() {
         let tracks = [uploaded("Een", "s1", Some(1.0))];
         let meta = Metadata {
-            author: Some("Ted van Lieshout".into()),
+            authors: Some(vec!["Ted van Lieshout".into()]),
             description: Some("Over een boer".into()),
             ..Metadata::default()
         };

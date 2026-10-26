@@ -104,12 +104,12 @@ enum Command {
 /// The playlist details shown in the Yoto app.
 #[derive(clap::Args)]
 struct MetadataArgs {
-    /// Author ("" removes it).
+    /// Author; repeat for several, the first is shown ("" alone removes them).
     #[arg(long, value_name = "NAME")]
-    author: Option<String>,
-    /// Narrator ("" removes it).
+    author: Vec<String>,
+    /// Narrator; repeat for several ("" alone removes them).
     #[arg(long, value_name = "NAME")]
-    read_by: Option<String>,
+    read_by: Vec<String>,
     /// Description ("" removes it).
     #[arg(long, value_name = "TEXT")]
     description: Option<String>,
@@ -136,8 +136,8 @@ fn age_parser() -> clap::builder::RangedI64ValueParser<u8> {
 impl From<MetadataArgs> for yoto_cli::metadata::Metadata {
     fn from(a: MetadataArgs) -> Self {
         yoto_cli::metadata::Metadata {
-            author: a.author,
-            read_by: a.read_by,
+            authors: (!a.author.is_empty()).then_some(a.author),
+            narrators: (!a.read_by.is_empty()).then_some(a.read_by),
             description: a.description,
             category: a.category,
             min_age: a.min_age,

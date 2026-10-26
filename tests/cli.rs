@@ -1777,7 +1777,7 @@ fn a_details_preview_shows_the_values_it_would_set() {
         "text",
     ]);
     assert_eq!(out.code, 0, "{}", out.stderr);
-    assert!(out.stdout.contains("remove author"), "{}", out.stdout);
+    assert!(out.stdout.contains("remove authors"), "{}", out.stdout);
     none.assert();
 }
 
@@ -1808,7 +1808,7 @@ fn people_are_saved_as_the_lists_yoto_keeps() {
     assert!(sent.get("readBy").is_none(), "{sent}");
     assert!(sent.get("author").is_none(), "{sent}");
     let change = out.json()["change"].as_str().unwrap().to_string();
-    assert_eq!(change, r#"set narrators to ["Ruben"]; remove author"#);
+    assert_eq!(change, r#"set narrators to ["Ruben"]; remove authors"#);
 
     // Re-running it against what Yoto then stores changes nothing.
     for m in stored {
@@ -1833,5 +1833,64 @@ fn people_are_saved_as_the_lists_yoto_keeps() {
     ]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(out.json()["changed"], false);
+    none.assert();
+}
+
+#[test]
+fn several_authors_and_narrators_are_kept_in_order() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let stored = mock_stored(&mut server, &stored_card());
+    let (create, seen) = mock_create(&mut server, json!({"cardId": "abc12"}), "abc12");
+    let edit = [
+        "content",
+        "edit",
+        "abc12",
+        "--author",
+        "Annie M.G. Schmidt",
+        "--author",
+        " Fiep Westendorp ",
+        "--read-by",
+        "Ruben",
+        "--read-by",
+        "Ted",
+    ];
+    let out = env.run(&[&edit[..], &["--yes"]].concat());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    create.assert();
+    let sent = seen.lock().unwrap()[0]["metadata"].clone();
+    assert_eq!(
+        sent["authors"],
+        json!(["Annie M.G. Schmidt", "Fiep Westendorp"])
+    );
+    assert_eq!(sent["author"], "Annie M.G. Schmidt");
+    assert_eq!(sent["narrators"], json!(["Ruben", "Ted"]));
+    assert_eq!(
+        out.json()["change"],
+        r#"set authors to ["Annie M.G. Schmidt","Fiep Westendorp"], narrators to ["Ruben","Ted"]"#
+    );
+
+    // Stored as sent, the same edit changes nothing.
+    for m in stored {
+        m.remove();
+    }
+    let mut saved = stored_card();
+    saved["metadata"]["author"] = json!("Annie M.G. Schmidt");
+    saved["metadata"]["authors"] = json!(["Annie M.G. Schmidt", "Fiep Westendorp"]);
+    saved["metadata"]["narrators"] = json!(["Ruben", "Ted"]);
+    let _stored = mock_stored(&mut server, &saved);
+    create.remove();
+    let none = server.mock("POST", "/content").expect(0).create();
+    let out = env.run(&[&edit[..], &["--yes"]].concat());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["changed"], false);
+
+    // "" removes everyone, so it cannot stand beside a name.
+    for flag in ["--author", "--read-by"] {
+        let out = env.run(&["content", "edit", "abc12", flag, "A", flag, "", "--yes"]);
+        assert_eq!(out.code, 1, "{flag}: {}", out.stderr);
+        assert_eq!(out.error()["kind"], "invalid_input", "{flag}");
+    }
     none.assert();
 }

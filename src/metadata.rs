@@ -49,11 +49,14 @@ pub const FIELDS: [&str; 8] = [
     "languages",
 ];
 
-/// Fields to set. `None` leaves a field as it is; an empty string removes it.
+/// Fields to set. `None` leaves a field as it is; an empty string removes it,
+/// and for the people a list holding only "" removes all of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Metadata {
-    pub author: Option<String>,
-    pub read_by: Option<String>,
+    /// Authors in order; the first is the one Yoto shows.
+    pub authors: Option<Vec<String>>,
+    /// Narrators in order.
+    pub narrators: Option<Vec<String>>,
     pub description: Option<String>,
     pub category: Option<Category>,
     pub min_age: Option<u8>,
@@ -69,6 +72,16 @@ impl Metadata {
 
     /// Check the fields on their own, before anything is sent.
     pub fn validate(&self) -> Result<()> {
+        for (flag, people) in [("--author", &self.authors), ("--read-by", &self.narrators)] {
+            if let Some(people) = people
+                && people.iter().any(|p| p.trim().is_empty())
+                && !names(people).is_empty()
+            {
+                return Err(Error::invalid(format!(
+                    "{flag} \"\" removes everyone and cannot be given beside a name"
+                )));
+            }
+        }
         for (flag, age) in [("--min-age", self.min_age), ("--max-age", self.max_age)] {
             if let Some(a) = age.filter(|a| *a > MAX_AGE) {
                 return Err(Error::invalid(format!(
@@ -98,23 +111,24 @@ impl Metadata {
                 metadata.insert(list.into(), json!([]));
             }
         };
-        match self.author.as_deref().map(str::trim) {
-            None => {}
-            Some("") => {
-                metadata.remove("author");
-                empty(metadata, "authors");
-            }
-            Some(v) => {
-                metadata.insert("author".into(), json!(v));
-                metadata.insert("authors".into(), json!([v]));
+        if let Some(authors) = self.authors.as_deref().map(names) {
+            match authors.first() {
+                None => {
+                    metadata.remove("author");
+                    empty(metadata, "authors");
+                }
+                Some(first) => {
+                    metadata.insert("author".into(), json!(first));
+                    metadata.insert("authors".into(), json!(authors));
+                }
             }
         }
-        if let Some(v) = self.read_by.as_deref().map(str::trim) {
+        if let Some(narrators) = self.narrators.as_deref().map(names) {
             metadata.remove("readBy");
-            if v.is_empty() {
+            if narrators.is_empty() {
                 empty(metadata, "narrators");
             } else {
-                metadata.insert("narrators".into(), json!([v]));
+                metadata.insert("narrators".into(), json!(narrators));
             }
         }
         match self.description.as_deref().map(str::trim) {
@@ -155,6 +169,21 @@ impl Metadata {
         Ok(())
     }
 
+    /// The fields this change removes, under their Yoto names.
+    pub fn removals(&self) -> Vec<&'static str> {
+        let people = |p: &Option<Vec<String>>| p.as_deref().is_some_and(|p| names(p).is_empty());
+        let text = |t: &Option<String>| t.as_deref().is_some_and(|t| t.trim().is_empty());
+        [
+            ("authors", people(&self.authors)),
+            ("narrators", people(&self.narrators)),
+            ("description", text(&self.description)),
+            ("languages", text(&self.language)),
+        ]
+        .into_iter()
+        .filter_map(|(field, removed)| removed.then_some(field))
+        .collect()
+    }
+
     /// The fields that will be set, as they go into the card.
     pub fn to_json(&self) -> Value {
         let mut map = Map::new();
@@ -163,6 +192,18 @@ impl Metadata {
         let _ = self.apply(&mut map);
         Value::Object(map)
     }
+}
+
+/// The names as stored: trimmed, without blanks, and each once in the place
+/// it was first given, so a list of only "" is empty and removes everyone.
+fn names(people: &[String]) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    for name in people.iter().map(|p| p.trim()) {
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// A loose BCP 47 check: letter subtags, then letter or digit subtags, each
@@ -190,8 +231,8 @@ mod tests {
     #[test]
     fn sets_given_fields_under_yoto_names_and_keeps_the_rest() {
         let m = Metadata {
-            author: Some(" Ted van Lieshout ".into()),
-            read_by: Some("Ruben".into()),
+            authors: Some(vec![" Ted van Lieshout ".into()]),
+            narrators: Some(vec!["Ruben".into()]),
             category: Some(Category::Stories),
             min_age: Some(2),
             max_age: Some(6),
@@ -224,8 +265,8 @@ mod tests {
     #[test]
     fn an_empty_value_removes_the_field() {
         let m = Metadata {
-            author: Some(String::new()),
-            read_by: Some(String::new()),
+            authors: Some(vec![String::new()]),
+            narrators: Some(vec![String::new()]),
             description: Some("  ".into()),
             language: Some(String::new()),
             ..Metadata::default()
@@ -245,10 +286,38 @@ mod tests {
     }
 
     #[test]
+    fn only_blanks_remove_everyone_and_a_blank_beside_a_name_is_refused() {
+        let blanks = Metadata {
+            authors: Some(vec![String::new(), "  ".into()]),
+            ..Metadata::default()
+        };
+        blanks.validate().unwrap();
+        assert_eq!(blanks.removals(), ["authors"]);
+        let mixed = Metadata {
+            narrators: Some(vec!["R".into(), " ".into()]),
+            ..Metadata::default()
+        };
+        assert_eq!(mixed.validate().unwrap_err().kind(), "invalid_input");
+    }
+
+    #[test]
+    fn a_name_given_twice_is_kept_once_in_its_first_place() {
+        let m = Metadata {
+            authors: Some(vec!["A".into(), "B".into(), " A ".into()]),
+            narrators: Some(vec!["R".into(), "R".into()]),
+            ..Metadata::default()
+        };
+        assert_eq!(
+            apply(&m, json!({})).unwrap(),
+            json!({"author": "A", "authors": ["A", "B"], "narrators": ["R"]})
+        );
+    }
+
+    #[test]
     fn removing_a_person_that_is_not_there_changes_nothing() {
         let m = Metadata {
-            author: Some(String::new()),
-            read_by: Some(String::new()),
+            authors: Some(vec![String::new()]),
+            narrators: Some(vec![String::new()]),
             ..Metadata::default()
         };
         let start = json!({"category": "stories"});

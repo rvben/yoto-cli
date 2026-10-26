@@ -446,14 +446,14 @@ pub fn content_edit(
                         .as_object()
                         .into_iter()
                         .flatten()
-                        // `authors` mirrors `author`, and an emptied list is
-                        // reported as a removal below.
+                        // `author` is the first of `authors`, and an emptied
+                        // list is reported as a removal below.
                         .filter(|(field, value)| {
-                            *field != "authors" && value.as_array().is_none_or(|a| !a.is_empty())
+                            *field != "author" && value.as_array().is_none_or(|a| !a.is_empty())
                         })
                         .map(|(field, value)| format!("{field} to {value}")),
                 );
-                let removed = metadata_removals(metadata);
+                let removed = metadata.removals();
                 let mut parts = Vec::new();
                 if !set.is_empty() {
                     parts.push(format!("set {}", set.join(", ")));
@@ -516,20 +516,6 @@ pub fn content_edit(
     }
     save(&client, card_id, &before, &after, &mut log)?;
     Ok(edit_output(card_id, &after, &what, EditState::Saved))
-}
-
-/// The text fields an edit removes by giving them as "".
-fn metadata_removals(m: &metadata::Metadata) -> Vec<String> {
-    [
-        ("author", &m.author),
-        ("narrators", &m.read_by),
-        ("description", &m.description),
-        ("languages", &m.language),
-    ]
-    .into_iter()
-    .filter(|(_, v)| v.as_deref().is_some_and(|v| v.trim().is_empty()))
-    .map(|(f, _)| f.to_string())
-    .collect()
 }
 
 pub struct AppendOptions<'a> {
@@ -908,7 +894,8 @@ pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) 
             text.push_str(&format!("Icons: {}\n", src.display()));
         }
         if let Value::Object(fields) = opts.metadata.to_json() {
-            for (k, v) in fields {
+            // `author` is the first of `authors`.
+            for (k, v) in fields.into_iter().filter(|(k, _)| k != "author") {
                 text.push_str(&format!(
                     "{k}: {}\n",
                     v.as_str().map_or(v.to_string(), str::to_string)

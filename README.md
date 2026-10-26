@@ -92,6 +92,9 @@ yoto-cli upload --yes "Boer Boris/Kaart" \
   --category stories --min-age 2 --max-age 6 --language nl
 ```
 
+Repeat `--author` or `--read-by` for several people, in order; the app shows
+the first author. A single `""` removes them all.
+
 To change a playlist later (new art, a corrected title) without breaking the
 card linked to it, replace it in place:
 

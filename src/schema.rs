@@ -14,8 +14,8 @@ pub const CLISPEC_VERSION: &str = "0.3";
 /// The playlist-detail flags shared by `upload` and `content edit`.
 fn metadata_args() -> Vec<Value> {
     vec![
-        json!({"name": "--author", "type": "string", "description": "Author shown in the Yoto app; \"\" removes it."}),
-        json!({"name": "--read-by", "type": "string", "description": "Narrator; \"\" removes it."}),
+        json!({"name": "--author", "type": "string[]", "description": "Author shown in the Yoto app; repeat the flag for several, in order, the first being the one Yoto shows; a name given twice is kept once. A single \"\" removes every author; \"\" beside a name is invalid_input."}),
+        json!({"name": "--read-by", "type": "string[]", "description": "Narrator; repeat the flag for several, in order; a name given twice is kept once. A single \"\" removes every narrator; \"\" beside a name is invalid_input."}),
         json!({"name": "--description", "type": "string", "description": "Description; \"\" removes it."}),
         json!({"name": "--category", "type": "string", "enum": ["none", "stories", "music", "radio", "podcast", "sfx", "activities", "alarms"], "description": "Yoto category."}),
         json!({"name": "--min-age", "type": "integer", "minimum": 0, "maximum": 99, "description": "Youngest age in years, 0 to 99; may not exceed the maximum age."}),
@@ -36,7 +36,7 @@ fn edit_output_fields() -> Value {
         {"name": "chapter_count", "type": "integer"},
         {"name": "track_count", "type": "integer"},
         {"name": "duration_seconds", "type": "number", "nullable": true},
-        {"name": "metadata", "type": "object", "description": "The playlist details after the change (with --dry-run: as they would be), under their Yoto names (author, authors, narrators, description, category, minAge, maxAge, languages; --read-by sets narrators); a detail that is not set is absent."},
+        {"name": "metadata", "type": "object", "description": "The playlist details after the change (with --dry-run: as they would be), under their Yoto names (author, authors, narrators, description, category, minAge, maxAge, languages; --author sets authors and author, the first of them; --read-by sets narrators); a detail that is not set is absent."},
         {"name": "chapters", "type": "array", "description": "The chapters after the change (with --dry-run: as they would be).", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "key", "type": "string", "nullable": true}, {"name": "title", "type": "string", "nullable": true}, {"name": "track_count", "type": "integer"}, {"name": "icon", "type": "string", "nullable": true}]}}
     ])
 }
@@ -350,7 +350,7 @@ pub fn contract() -> Value {
                     {"name": "icons_file", "type": "string", "nullable": true, "description": "Only with --dry-run: the icons.json used."},
                     {"name": "dry_run", "type": "boolean", "description": "Only with --dry-run."},
                     {"name": "chapters", "type": "array", "description": "Only with --dry-run.", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "title", "type": "string"}, {"name": "track_count", "type": "integer"}, {"name": "icon", "type": "string", "nullable": true, "description": "Image path or yoto:# reference; null for the default icon."}]}},
-                    {"name": "metadata", "type": "object", "description": "Only with --dry-run: the playlist details that would be set, under their Yoto names (author, authors, narrators, description, category, minAge, maxAge, languages; --read-by sets narrators)."},
+                    {"name": "metadata", "type": "object", "description": "Only with --dry-run: the playlist details that would be set, under their Yoto names (author, authors, narrators, description, category, minAge, maxAge, languages; --author sets authors and author, the first of them; --read-by sets narrators)."},
                     {"name": "tracks", "type": "array", "description": "Only with --dry-run.", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "chapter", "type": "integer", "description": "Number of the chapter holding the track."}, {"name": "title", "type": "string"}, {"name": "file", "type": "string"}, {"name": "bytes", "type": "integer"}, {"name": "format", "type": "string", "enum": ["mp3", "m4a", "wav", "flac", "ogg"]}, {"name": "duration_seconds", "type": "number", "nullable": true}, {"name": "on_end", "type": "string", "nullable": true, "enum": ["stop", "repeat"]}, {"name": "icon", "type": "string", "nullable": true, "description": "The chapter's icon."}]}},
                     {"name": "ignored", "type": "array", "items": {"type": "string"}, "description": "Only with --dry-run: files in the folder (or a subfolder, as `sub/name`) that are not uploaded, and folders nested deeper than one level (as `sub/deeper/`)."}
                 ]
@@ -378,8 +378,8 @@ pub fn contract() -> Value {
             }
         ],
         "errors": [
-            {"kind": "invalid_input", "exit_code": 1, "retryable": false, "description": "A local input is missing or unusable: folder, manifest, audio in no supported format, a playlist detail out of range, a size or SHA-256 that does not match the manifest, or a bad cover, icon or icons.json."},
-            {"kind": "usage", "exit_code": 3, "retryable": false, "description": "Invalid command-line arguments, a missing client ID, or a manifest book needing --playlist."},
+            {"kind": "invalid_input", "exit_code": 1, "retryable": false, "description": "A local input is missing or unusable: folder, manifest, audio in no supported format, a minimum age above the maximum age, a language that is not a BCP 47 tag, \"\" beside a name in --author or --read-by, a size or SHA-256 that does not match the manifest, or a bad cover, icon or icons.json."},
+            {"kind": "usage", "exit_code": 3, "retryable": false, "description": "Invalid command-line arguments (including an age outside 0 to 99), a missing client ID, or a manifest book needing --playlist."},
             {"kind": "not_authenticated", "exit_code": 4, "retryable": false, "description": "Not signed in, or the sign-in was rejected or can no longer be refreshed."},
             {"kind": "confirmation_required", "exit_code": 5, "retryable": false, "description": "A mutating command was run without --yes. Nothing was changed. A playlist change that would leave the playlist as it was needs no --yes: it succeeds with changed false."},
             {"kind": "limit_exceeded", "exit_code": 6, "retryable": false, "description": "The playlist breaks a Yoto limit."},

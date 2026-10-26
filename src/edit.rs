@@ -717,7 +717,7 @@ mod tests {
         apply_metadata(
             &mut c,
             &Metadata {
-                author: Some(String::new()),
+                authors: Some(vec![String::new()]),
                 description: Some("Over een boer".into()),
                 ..Metadata::default()
             },
