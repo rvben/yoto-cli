@@ -48,8 +48,9 @@ refreshed automatically, also in the middle of a long upload;
 
 ## Upload a playlist
 
-Point `upload` at a folder of MP3 or M4A files. Tracks are taken in file-name
-order and a numeric prefix such as `01 - ` is dropped from the title. A
+Point `upload` at a folder of audio files: MP3, M4A/AAC, WAV, FLAC,
+Ogg (Opus or Vorbis) or AIFF, recognised by their content rather than their
+extension. Tracks are taken in file-name order and a numeric prefix such as `01 - ` is dropped from the title. A
 `cover.jpg` or `cover.png` in the folder (or its parent) becomes the cover;
 `--cover FILE` picks another and `--no-cover` sends none. The title defaults to
 the folder name (`--title` overrides it).
@@ -64,8 +65,29 @@ and 60 minutes per track, and 500 MB per playlist. Yoto keeps files by SHA-256,
 so a file it already has is not uploaded again and an interrupted run can
 simply be repeated.
 
-Each track becomes its own chapter, so the skip buttons on the player move
-between them. Linking the playlist to a physical card is done in the Yoto app.
+Each file becomes its own chapter, so the skip buttons on the player move
+between them. A subfolder becomes one chapter of the files in it, played in
+order, which suits a song in parts or a story split into several files:
+
+```
+Liedjes/
+  01 - Intro.mp3          chapter 1
+  02 - Vol. 2/            chapter 2 "Vol. 2"
+    01 - Eerste.mp3
+    02 - Tweede.mp3
+  03 - Slot.mp3           chapter 3
+```
+
+Linking the playlist to a physical card is done in the Yoto app.
+
+The details shown in the Yoto app can be set at the same time:
+
+```sh
+yoto-cli upload --yes "Boer Boris/Kaart" \
+  --author "Ted van Lieshout" --read-by "Ruben" \
+  --description "Boer Boris en zijn dieren" \
+  --category stories --min-age 2 --max-age 6 --language nl
+```
 
 To change a playlist later (new art, a corrected title) without breaking the
 card linked to it, replace it in place:
@@ -78,7 +100,8 @@ yoto-cli upload --yes --replace <CARD_ID> "Boer Boris/Kaart"
 ### Chapter icons
 
 The player shows a 16x16 pixel icon while a chapter plays. Put an `icons.json`
-beside the audio (or in the book folder) mapping track numbers to icons:
+beside the audio (or in the book folder) mapping chapter numbers to icons
+(without subfolders, chapter numbers are track numbers):
 
 ```json
 {
@@ -91,7 +114,7 @@ beside the audio (or in the book folder) mapping track numbers to icons:
 A value is either an image path relative to the JSON file, uploaded as your own
 icon, or a `yoto:#<mediaId>` reference to an icon Yoto already has. A 16x16 RGBA
 PNG or a 16x16 GIF is kept exactly as drawn; any other PNG, GIF or JPEG is
-resized by Yoto. Tracks without an entry get `"default"`, or Yoto's standard
+resized by Yoto. Chapters without an entry get `"default"`, or Yoto's standard
 icon when there is none.
 
 Find public icons by title or tag:
@@ -111,6 +134,16 @@ SHA-256 of every file:
 
 ```sh
 yoto-cli upload --dry-run --manifest manifest.json --book boerboris
+```
+
+An entry may also name a `chapter`: consecutive entries with the same chapter
+play as one chapter. `"on_end": "stop"` or `"repeat"` sets what the player does
+when that track ends, such as stopping after a bedtime story or repeating a
+lullaby:
+
+```json
+{"file": "Kaart/05.mp3", "title": "Slaapliedje", "bytes": 1234567,
+ "sha256": "...", "chapter": "Welterusten", "on_end": "repeat"}
 ```
 
 ## Other commands

@@ -13,6 +13,7 @@ pub mod config;
 pub mod error;
 pub mod icons;
 pub mod keychain;
+pub mod metadata;
 pub mod plan;
 pub mod schema;
 pub mod upload;
@@ -374,6 +375,7 @@ pub struct UploadOptions<'a> {
     pub no_icons: bool,
     /// Replace this existing playlist instead of creating a new one.
     pub replace: Option<String>,
+    pub metadata: metadata::Metadata,
     pub dry_run: bool,
     pub yes: bool,
     pub transcode_timeout: Duration,
@@ -423,14 +425,21 @@ pub fn build_plan(opts: &UploadOptions) -> Result<plan::Plan> {
         plan.icons.default = Some(icons::Icon::parse(spec, &cwd)?);
     }
     plan.check_limits()?;
+    opts.metadata.validate()?;
+    opts.metadata.apply(&mut serde_json::Map::new())?;
     Ok(plan)
 }
 
 /// `upload`: create a playlist from a folder or a manifest playlist.
 pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) -> Result<Output> {
     let plan = build_plan(opts)?;
+    let chapters = if plan.chapters.len() == plan.tracks.len() {
+        String::new()
+    } else {
+        format!(" in {} chapters", plan.chapters.len())
+    };
     let summary = format!(
-        "{:?}: {} tracks, {}{}",
+        "{:?}: {} tracks{chapters}, {}{}",
         plan.title,
         plan.tracks.len(),
         format_mb(plan.total_bytes()),
@@ -456,6 +465,7 @@ pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) 
         let mut json = plan.to_json();
         json["dry_run"] = json!(true);
         json["replace"] = json!(opts.replace);
+        json["metadata"] = opts.metadata.to_json();
         let mut text = match &opts.replace {
             Some(id) => format!("Would replace playlist {id} with {summary}\n"),
             None => format!("Would create {summary}\n"),
@@ -466,23 +476,44 @@ pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) 
         if let Some(src) = &plan.icons.source {
             text.push_str(&format!("Icons: {}\n", src.display()));
         }
-        for (i, t) in plan.tracks.iter().enumerate() {
-            let icon = plan
-                .icons
-                .for_track(i + 1)
-                .map(|ic| ic.describe())
-                .unwrap_or_else(|| "default icon".into());
-            let icon = icon.rsplit('/').next().unwrap_or(&icon).to_string();
-            text.push_str(&format!(
-                "{:>3}. {:>8}  {:>8}  {}  [{}; {icon}]\n",
-                i + 1,
+        if let Value::Object(fields) = opts.metadata.to_json() {
+            for (k, v) in fields {
+                text.push_str(&format!(
+                    "{k}: {}\n",
+                    v.as_str().map_or(v.to_string(), str::to_string)
+                ));
+            }
+        }
+        let track_line = |t: &plan::PlannedTrack| {
+            format!(
+                "{:>8}  {:>8}  {}  [{}{}]",
                 t.duration_seconds
                     .map(format_duration)
                     .unwrap_or_else(|| "n/a".into()),
                 format_mb(t.bytes),
                 t.title,
-                t.format.name()
-            ));
+                t.format.name(),
+                t.on_end
+                    .map(|e| format!("; then {}", e.name()))
+                    .unwrap_or_default(),
+            )
+        };
+        for (i, c) in plan.chapters.iter().enumerate() {
+            let icon = plan
+                .icons
+                .for_chapter(i + 1)
+                .map(|ic| ic.describe())
+                .unwrap_or_else(|| "default icon".into());
+            let icon = icon.rsplit('/').next().unwrap_or(&icon).to_string();
+            let tracks = &plan.tracks[c.tracks.clone()];
+            if let [t] = tracks {
+                text.push_str(&format!("{:>3}. {}  [{icon}]\n", i + 1, track_line(t)));
+            } else {
+                text.push_str(&format!("{:>3}. {}  [{icon}]\n", i + 1, c.title));
+                for (j, t) in tracks.iter().enumerate() {
+                    text.push_str(&format!("     {:>2}) {}\n", j + 1, track_line(t)));
+                }
+            }
         }
         if !plan.ignored.is_empty() {
             text.push_str(&format!("Ignored: {}\n", plan.ignored.join(", ")));
@@ -513,11 +544,12 @@ pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) 
             transcode_timeout: opts.transcode_timeout,
             upload_cover: plan.cover.is_some(),
             replace: opts.replace.clone(),
+            metadata: opts.metadata.clone(),
         },
         &mut log,
     )?;
     let text = format!(
-        "{} {:?} ({}): {} tracks ({} uploaded, {} already on Yoto){}.\n{}",
+        "{} {:?} ({}): {} tracks{chapters} ({} uploaded, {} already on Yoto){}.\n{}",
         if opts.replace.is_some() {
             "Replaced"
         } else {

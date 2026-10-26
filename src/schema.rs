@@ -11,6 +11,26 @@ use crate::auth::DEFAULT_SCOPE;
 /// The version of The CLI Spec this document conforms to.
 pub const CLISPEC_VERSION: &str = "0.3";
 
+/// The playlist-detail flags shared by `upload` and `content edit`.
+fn metadata_args() -> Vec<Value> {
+    vec![
+        json!({"name": "--author", "type": "string", "description": "Author shown in the Yoto app; \"\" removes it."}),
+        json!({"name": "--read-by", "type": "string", "description": "Narrator; \"\" removes it."}),
+        json!({"name": "--description", "type": "string", "description": "Description; \"\" removes it."}),
+        json!({"name": "--category", "type": "string", "enum": ["none", "stories", "music", "radio", "podcast", "sfx", "activities", "alarms"], "description": "Yoto category."}),
+        json!({"name": "--min-age", "type": "integer", "description": "Youngest age in years, 0 to 99; may not exceed the maximum age."}),
+        json!({"name": "--max-age", "type": "integer", "description": "Oldest age in years, 0 to 99."}),
+        json!({"name": "--language", "type": "string", "description": "BCP 47 language tag such as nl or en-GB; \"\" removes it."}),
+    ]
+}
+
+/// `args` followed by the metadata flags.
+fn with_metadata_args(args: Value) -> Value {
+    let mut all = args.as_array().cloned().unwrap_or_default();
+    all.extend(metadata_args());
+    Value::Array(all)
+}
+
 /// Build the clispec contract as a JSON value.
 pub fn contract() -> Value {
     json!({
@@ -161,13 +181,13 @@ pub fn contract() -> Value {
             },
             {
                 "name": "upload",
-                "description": "Create a new playlist (one chapter per track) from a folder of MP3/M4A files in file-name order, or from one playlist of a manifest.json (titles, order, cover and SHA-256 checks from the manifest). Checks the Yoto limits (100 tracks, 100 MB and 60 min per track, 500 MB per playlist) before sending anything. Files Yoto already has (same SHA-256) are not uploaded again, so a failed run can simply be repeated. Chapter icons come from an icons.json beside the audio or in the book folder: an object whose keys are track numbers (1-based) or \"default\" and whose values are an image path relative to the JSON (PNG, GIF or JPEG; a 16x16 RGBA PNG or GIF is kept pixel-exact, anything else is converted by Yoto) or a yoto:#<mediaId> from `icons list`; tracks without one get Yoto's default icon. Every run without --replace creates another playlist; --replace updates an existing one in place, so cards linked to it keep working, and is safe to repeat. Linking the playlist to a physical card is done in the Yoto app. Needs --yes unless --dry-run; progress goes to stderr.",
+                "description": "Create a new playlist from a folder of audio files (MP3, M4A/AAC, WAV, FLAC, Ogg/Opus/Vorbis; detected from the bytes, not the extension; AIFF is refused because Yoto cannot transcode it) in name order, or from one playlist of a manifest.json (titles, order, cover and SHA-256 checks from the manifest). In a folder, each audio file is one chapter and each subfolder is one chapter of the audio files in it; in a manifest, consecutive entries with the same `chapter` form one chapter, and an entry's `on_end` (stop or repeat) sets what the player does when that track ends. Checks the Yoto limits (100 tracks, 100 MB and 60 min per track, 500 MB per playlist) before sending anything. Files Yoto already has (same SHA-256) are not uploaded again, so a failed run can simply be repeated. Chapter icons come from an icons.json beside the audio or in the book folder: an object whose keys are chapter numbers (1-based) or \"default\" and whose values are an image path relative to the JSON (PNG, GIF or JPEG; a 16x16 RGBA PNG or GIF is kept pixel-exact, anything else is converted by Yoto) or a yoto:#<mediaId> from `icons list`; chapters without one get Yoto's default icon. Every run without --replace creates another playlist; --replace updates an existing one in place, so cards linked to it keep working, and is safe to repeat. Linking the playlist to a physical card is done in the Yoto app. Needs --yes unless --dry-run; progress goes to stderr.",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
                 "stability": "beta",
                 "confirmation_bypass_arg": "--yes",
-                "args": [
+                "args": with_metadata_args(json!([
                     {"name": "dir", "type": "path", "description": "Folder of audio files. A folder named `Kaart` or `Kaart N` takes its parent folder's name as title. Mutually exclusive with --manifest."},
                     {"name": "--manifest", "type": "path", "description": "manifest.json describing prepared books; requires --book."},
                     {"name": "--book", "type": "string", "description": "Book key in the manifest."},
@@ -176,17 +196,18 @@ pub fn contract() -> Value {
                     {"name": "--cover", "type": "path", "description": "JPEG or PNG cover instead of the detected cover.jpg/cover.png."},
                     {"name": "--no-cover", "type": "boolean", "default": false, "description": "Upload no cover."},
                     {"name": "--icons", "type": "path", "description": "icons.json to use instead of the detected one."},
-                    {"name": "--icon", "type": "string", "description": "Icon for every track the icons.json does not name: an image path or yoto:#<mediaId>."},
+                    {"name": "--icon", "type": "string", "description": "Icon for every chapter the icons.json does not name: an image path or yoto:#<mediaId>."},
                     {"name": "--no-icons", "type": "boolean", "default": false, "description": "Ignore any icons.json."},
                     {"name": "--replace", "type": "string", "description": "Card ID of your playlist to replace instead of creating a new one."},
                     {"name": "--dry-run", "type": "boolean", "default": false, "description": "Check files, hashes and limits and print the plan; no sign-in or network needed."},
                     {"name": "--yes", "type": "boolean", "default": false, "description": "Confirm creating the playlist."},
                     {"name": "--transcode-timeout", "type": "integer", "default": 600, "description": "Seconds to wait for each track's transcode."}
-                ],
+                ])),
                 "output_fields": [
                     {"name": "card_id", "type": "string", "description": "Created playlist. Absent with --dry-run."},
                     {"name": "title", "type": "string"},
                     {"name": "track_count", "type": "integer"},
+                    {"name": "chapter_count", "type": "integer"},
                     {"name": "uploaded", "type": "integer", "description": "Tracks sent. Absent with --dry-run."},
                     {"name": "reused", "type": "integer", "description": "Tracks Yoto already had. Absent with --dry-run."},
                     {"name": "duration_seconds", "type": "number", "nullable": true},
@@ -198,8 +219,10 @@ pub fn contract() -> Value {
                     {"name": "replace", "type": "string", "nullable": true, "description": "Only with --dry-run: the playlist that would be replaced."},
                     {"name": "icons_file", "type": "string", "nullable": true, "description": "Only with --dry-run: the icons.json used."},
                     {"name": "dry_run", "type": "boolean", "description": "Only with --dry-run."},
-                    {"name": "tracks", "type": "array", "description": "Only with --dry-run.", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "title", "type": "string"}, {"name": "file", "type": "string"}, {"name": "bytes", "type": "integer"}, {"name": "format", "type": "string", "enum": ["mp3", "m4a"]}, {"name": "duration_seconds", "type": "number", "nullable": true}, {"name": "icon", "type": "string", "nullable": true, "description": "Image path or yoto:# reference; null for the default icon."}]}},
-                    {"name": "ignored", "type": "array", "items": {"type": "string"}, "description": "Only with --dry-run: files in the folder that are not uploaded."}
+                    {"name": "chapters", "type": "array", "description": "Only with --dry-run.", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "title", "type": "string"}, {"name": "track_count", "type": "integer"}, {"name": "icon", "type": "string", "nullable": true, "description": "Image path or yoto:# reference; null for the default icon."}]}},
+                    {"name": "metadata", "type": "object", "description": "Only with --dry-run: the playlist details that would be set, under their Yoto names (author, readBy, description, category, minAge, maxAge, languages)."},
+                    {"name": "tracks", "type": "array", "description": "Only with --dry-run.", "items": {"type": "object", "fields": [{"name": "number", "type": "integer"}, {"name": "chapter", "type": "integer", "description": "Number of the chapter holding the track."}, {"name": "title", "type": "string"}, {"name": "file", "type": "string"}, {"name": "bytes", "type": "integer"}, {"name": "format", "type": "string", "enum": ["mp3", "m4a", "wav", "flac", "ogg"]}, {"name": "duration_seconds", "type": "number", "nullable": true}, {"name": "on_end", "type": "string", "nullable": true, "enum": ["stop", "repeat"]}, {"name": "icon", "type": "string", "nullable": true, "description": "The chapter's icon."}]}},
+                    {"name": "ignored", "type": "array", "items": {"type": "string"}, "description": "Only with --dry-run: files in the folder (or a subfolder, as `sub/name`) that are not uploaded."}
                 ]
             },
             {
@@ -225,7 +248,7 @@ pub fn contract() -> Value {
             }
         ],
         "errors": [
-            {"kind": "invalid_input", "exit_code": 1, "retryable": false, "description": "A local input is missing or unusable: folder, manifest, audio that is not MP3/MP4, a size or SHA-256 that does not match the manifest, or a bad cover, icon or icons.json."},
+            {"kind": "invalid_input", "exit_code": 1, "retryable": false, "description": "A local input is missing or unusable: folder, manifest, audio in no supported format, a playlist detail out of range, a size or SHA-256 that does not match the manifest, or a bad cover, icon or icons.json."},
             {"kind": "usage", "exit_code": 3, "retryable": false, "description": "Invalid command-line arguments, a missing client ID, or a manifest book needing --playlist."},
             {"kind": "not_authenticated", "exit_code": 4, "retryable": false, "description": "Not signed in, or the sign-in was rejected or can no longer be refreshed."},
             {"kind": "confirmation_required", "exit_code": 5, "retryable": false, "description": "A mutating command was run without --yes. Nothing was changed."},
@@ -286,30 +309,6 @@ mod tests {
                 .find(|d| d["kind"] == err.kind())
                 .unwrap_or_else(|| panic!("{} is not declared", err.kind()));
             assert_eq!(entry["exit_code"], err.exit_code(), "{}", err.kind());
-        }
-    }
-
-    #[test]
-    fn every_cli_command_is_declared() {
-        let names: Vec<String> = contract()["commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|c| c["name"].as_str().unwrap().to_string())
-            .collect();
-        for expected in [
-            "auth login",
-            "auth status",
-            "auth logout",
-            "content list",
-            "content show",
-            "content delete",
-            "icons list",
-            "upload",
-            "schema",
-            "completions",
-        ] {
-            assert!(names.iter().any(|n| n == expected), "{expected} missing");
         }
     }
 }

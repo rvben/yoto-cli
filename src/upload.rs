@@ -4,12 +4,13 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::api::{Client, Transcoded};
 use crate::error::{Error, Result};
 use crate::icons::{Icon, ImageInfo};
-use crate::plan::{self, Plan};
+use crate::metadata::Metadata;
+use crate::plan::{self, OnEnd, Plan};
 
 /// The icon from Yoto's upload example, for tracks without a chosen icon.
 pub const DEFAULT_ICON: &str = "yoto:#aUm9i3ex3qqAMYBv-i-O-pYMKuMJGICtR3Vhf289u2Q";
@@ -19,6 +20,7 @@ pub struct Options {
     pub upload_cover: bool,
     /// Replace this existing playlist instead of creating a new one.
     pub replace: Option<String>,
+    pub metadata: Metadata,
 }
 
 /// One finished track, ready to go into the playlist.
@@ -26,10 +28,17 @@ pub struct Options {
 pub struct Uploaded {
     pub title: String,
     pub transcoded: Transcoded,
-    /// `yoto:#<mediaId>` shown while this track plays.
-    pub icon: String,
     /// Yoto already had this file, so it was not uploaded again.
     pub reused: bool,
+    pub on_end: Option<OnEnd>,
+}
+
+/// One chapter of finished tracks.
+pub struct ChapterBody<'a> {
+    pub title: &'a str,
+    /// `yoto:#<mediaId>` shown while the chapter's tracks play.
+    pub icon: &'a str,
+    pub tracks: &'a [Uploaded],
 }
 
 /// Run the upload. `log` receives one human progress line per step (stderr).
@@ -94,11 +103,21 @@ pub fn run(
             title: track.title.clone(),
             transcoded,
             reused,
-            icon: icon_refs[i].clone(),
+            on_end: track.on_end,
         });
     }
 
-    let mut body = content_body(&plan.title, &done, cover_url.as_deref())?;
+    let chapters: Vec<ChapterBody> = plan
+        .chapters
+        .iter()
+        .zip(&icon_refs)
+        .map(|(c, icon)| ChapterBody {
+            title: &c.title,
+            icon,
+            tracks: &done[c.tracks.clone()],
+        })
+        .collect();
+    let mut body = content_body(&plan.title, &chapters, cover_url.as_deref(), &opts.metadata)?;
     match &opts.replace {
         Some(id) => {
             body["cardId"] = json!(id);
@@ -117,6 +136,7 @@ pub fn run(
     Ok(json!({
         "card_id": card_id,
         "title": plan.title,
+        "chapter_count": chapters.len(),
         "track_count": done.len(),
         "uploaded": done.iter().filter(|u| !u.reused).count(),
         "reused": done.iter().filter(|u| u.reused).count(),
@@ -128,13 +148,13 @@ pub fn run(
     }))
 }
 
-/// Resolve every track's icon to a `yoto:#` reference, uploading each
+/// Resolve every chapter's icon to a `yoto:#` reference, uploading each
 /// distinct image file once.
 fn upload_icons(client: &Client, plan: &Plan, log: &mut impl FnMut(String)) -> Result<Vec<String>> {
     let mut uploaded: BTreeMap<&Icon, String> = BTreeMap::new();
-    let mut refs = Vec::with_capacity(plan.tracks.len());
-    for number in 1..=plan.tracks.len() {
-        let reference = match plan.icons.for_track(number) {
+    let mut refs = Vec::with_capacity(plan.chapters.len());
+    for number in 1..=plan.chapters.len() {
+        let reference = match plan.icons.for_chapter(number) {
             None => DEFAULT_ICON.to_string(),
             Some(Icon::Yoto(id)) => format!("yoto:#{id}"),
             Some(icon @ Icon::File(path)) => match uploaded.get(icon) {
@@ -176,61 +196,76 @@ fn upload_icons(client: &Client, plan: &Plan, log: &mut impl FnMut(String)) -> R
     Ok(refs)
 }
 
-/// The `POST /content` body: one chapter per track, numbered from 1, so the
-/// player's skip buttons move between the book's parts.
-pub fn content_body(title: &str, tracks: &[Uploaded], cover_url: Option<&str>) -> Result<Value> {
-    let mut chapters = Vec::with_capacity(tracks.len());
+/// The `POST /content` body. Chapters are numbered from 1, so the player's
+/// skip buttons move between the book's parts; a chapter's tracks play in
+/// order.
+pub fn content_body(
+    title: &str,
+    chapters: &[ChapterBody],
+    cover_url: Option<&str>,
+    meta: &Metadata,
+) -> Result<Value> {
+    let mut out = Vec::with_capacity(chapters.len());
     let mut total_duration = 0.0;
     let mut total_size = 0u64;
-    for (i, u) in tracks.iter().enumerate() {
-        let t = &u.transcoded;
-        // Duration and size are required track fields; Yoto must report them.
-        let missing = |field: &str| Error::Api {
-            status: 200,
-            message: format!("transcode of {:?} reported no {field}", u.title),
-        };
-        let duration = t.duration.ok_or_else(|| missing("duration"))?;
-        let file_size = t.file_size.ok_or_else(|| missing("fileSize"))?;
-        let format = t.format.clone().ok_or_else(|| missing("format"))?;
-        total_duration += duration;
-        total_size += file_size;
+    for (i, c) in chapters.iter().enumerate() {
         let label = (i + 1).to_string();
-        let key = format!("{:02}", i + 1);
-        let mut track = json!({
-            "key": "01",
-            "title": u.title,
-            "trackUrl": format!("yoto:#{}", t.sha256),
-            "duration": duration,
-            "fileSize": file_size,
-            "format": format,
-            "type": "audio",
-            "overlayLabel": label,
-            "display": {"icon16x16": u.icon},
-        });
-        if let Some(ch) = &t.channels {
-            track["channels"] = ch.clone();
+        let mut tracks = Vec::with_capacity(c.tracks.len());
+        for (j, u) in c.tracks.iter().enumerate() {
+            let t = &u.transcoded;
+            // Duration and size are required track fields; Yoto must report them.
+            let missing = |field: &str| Error::Api {
+                status: 200,
+                message: format!("transcode of {:?} reported no {field}", u.title),
+            };
+            let duration = t.duration.ok_or_else(|| missing("duration"))?;
+            let file_size = t.file_size.ok_or_else(|| missing("fileSize"))?;
+            let format = t.format.clone().ok_or_else(|| missing("format"))?;
+            total_duration += duration;
+            total_size += file_size;
+            let mut track = json!({
+                "key": format!("{:02}", j + 1),
+                "title": u.title,
+                "trackUrl": format!("yoto:#{}", t.sha256),
+                "duration": duration,
+                "fileSize": file_size,
+                "format": format,
+                "type": "audio",
+                "overlayLabel": label,
+                "display": {"icon16x16": c.icon},
+            });
+            if let Some(ch) = &t.channels {
+                track["channels"] = ch.clone();
+            }
+            if let Some(end) = u.on_end {
+                track["events"] = json!({"onEnd": {"cmd": end.name()}});
+            }
+            tracks.push(track);
         }
-        chapters.push(json!({
-            "key": key,
-            "title": u.title,
+        out.push(json!({
+            "key": format!("{:02}", i + 1),
+            "title": c.title,
             "overlayLabel": label,
-            "tracks": [track],
-            "display": {"icon16x16": u.icon},
+            "tracks": tracks,
+            "display": {"icon16x16": c.icon},
         }));
     }
-    let mut metadata = json!({
-        "media": {
+    let mut metadata = Map::new();
+    metadata.insert(
+        "media".into(),
+        json!({
             "duration": total_duration,
             "fileSize": total_size,
             "readableFileSize": (total_size as f64 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
-        }
-    });
+        }),
+    );
     if let Some(url) = cover_url {
-        metadata["cover"] = json!({"imageL": url});
+        metadata.insert("cover".into(), json!({"imageL": url}));
     }
+    meta.apply(&mut metadata)?;
     Ok(json!({
         "title": title,
-        "content": {"chapters": chapters},
+        "content": {"chapters": out},
         "metadata": metadata,
     }))
 }
@@ -250,19 +285,32 @@ mod tests {
                 format: Some("mp3".into()),
             },
             reused: false,
-            icon: DEFAULT_ICON.into(),
+            on_end: None,
         }
+    }
+
+    fn single<'a>(tracks: &'a [Uploaded]) -> Vec<ChapterBody<'a>> {
+        tracks
+            .iter()
+            .map(|t| ChapterBody {
+                title: &t.title,
+                icon: DEFAULT_ICON,
+                tracks: std::slice::from_ref(t),
+            })
+            .collect()
     }
 
     #[test]
     fn body_has_one_numbered_chapter_per_track() {
+        let tracks = [
+            uploaded("Een", "s1", Some(10.0)),
+            uploaded("Twee", "s2", Some(20.5)),
+        ];
         let body = content_body(
             "Boer Boris",
-            &[
-                uploaded("Een", "s1", Some(10.0)),
-                uploaded("Twee", "s2", Some(20.5)),
-            ],
+            &single(&tracks),
             Some("https://cover.example/c.jpg"),
+            &Metadata::default(),
         )
         .unwrap();
         let chapters = body["content"]["chapters"].as_array().unwrap();
@@ -271,11 +319,13 @@ mod tests {
         assert_eq!(chapters[1]["overlayLabel"], "2");
         assert_eq!(chapters[1]["title"], "Twee");
         let t = &chapters[1]["tracks"][0];
+        assert_eq!(t["key"], "01");
         assert_eq!(t["trackUrl"], "yoto:#s2");
         assert_eq!(t["duration"], 20.5);
         assert_eq!(t["type"], "audio");
         assert_eq!(t["channels"], "stereo");
         assert_eq!(t["display"]["icon16x16"], DEFAULT_ICON);
+        assert!(t.get("events").is_none());
         assert_eq!(chapters[1]["display"]["icon16x16"], DEFAULT_ICON);
         assert_eq!(body["metadata"]["media"]["duration"], 30.5);
         assert_eq!(body["metadata"]["media"]["fileSize"], 2_097_152);
@@ -284,18 +334,74 @@ mod tests {
             body["metadata"]["cover"]["imageL"],
             "https://cover.example/c.jpg"
         );
+        assert!(body["metadata"].get("author").is_none());
+    }
+
+    #[test]
+    fn a_chapter_holds_its_tracks_in_order_with_their_end_actions() {
+        let mut tracks = [
+            uploaded("Intro", "s1", Some(1.0)),
+            uploaded("Couplet", "s2", Some(2.0)),
+            uploaded("Refrein", "s3", Some(3.0)),
+        ];
+        tracks[2].on_end = Some(OnEnd::Repeat);
+        let icon = "yoto:#7Wt--qhx9t7PCSC8WBmGKJvlG53Z1uk7bN1dE9wGWJ0";
+        let chapters = [
+            ChapterBody {
+                title: "Intro",
+                icon: DEFAULT_ICON,
+                tracks: &tracks[..1],
+            },
+            ChapterBody {
+                title: "Lied",
+                icon,
+                tracks: &tracks[1..],
+            },
+        ];
+        let body = content_body("x", &chapters, None, &Metadata::default()).unwrap();
+        let lied = &body["content"]["chapters"][1];
+        assert_eq!(lied["key"], "02");
+        assert_eq!(lied["title"], "Lied");
+        let keys: Vec<_> = lied["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| (t["key"].as_str().unwrap(), t["title"].as_str().unwrap()))
+            .collect();
+        assert_eq!(keys, [("01", "Couplet"), ("02", "Refrein")]);
+        assert_eq!(lied["tracks"][1]["overlayLabel"], "2");
+        assert_eq!(lied["tracks"][1]["display"]["icon16x16"], icon);
+        assert_eq!(lied["tracks"][1]["events"]["onEnd"]["cmd"], "repeat");
+        assert!(lied["tracks"][0].get("events").is_none());
+        assert_eq!(body["metadata"]["media"]["duration"], 6.0);
+    }
+
+    #[test]
+    fn metadata_goes_into_the_body() {
+        let tracks = [uploaded("Een", "s1", Some(1.0))];
+        let meta = Metadata {
+            author: Some("Ted van Lieshout".into()),
+            description: Some("Over een boer".into()),
+            ..Metadata::default()
+        };
+        let body = content_body("x", &single(&tracks), None, &meta).unwrap();
+        assert_eq!(body["metadata"]["author"], "Ted van Lieshout");
+        assert_eq!(body["metadata"]["description"], "Over een boer");
+        assert_eq!(body["metadata"]["media"]["duration"], 1.0);
     }
 
     #[test]
     fn missing_transcode_duration_is_an_error_not_zero() {
-        let err = content_body("x", &[uploaded("Een", "s1", None)], None).unwrap_err();
+        let tracks = [uploaded("Een", "s1", None)];
+        let err = content_body("x", &single(&tracks), None, &Metadata::default()).unwrap_err();
         assert_eq!(err.kind(), "api_error");
         assert!(err.to_string().contains("duration"));
     }
 
     #[test]
     fn no_cover_means_no_cover_field() {
-        let body = content_body("x", &[uploaded("Een", "s1", Some(1.0))], None).unwrap();
+        let tracks = [uploaded("Een", "s1", Some(1.0))];
+        let body = content_body("x", &single(&tracks), None, &Metadata::default()).unwrap();
         assert!(body["metadata"].get("cover").is_none());
     }
 }

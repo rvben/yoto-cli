@@ -1,7 +1,8 @@
 //! Chapter icons: the 16x16 pixel art a player shows while a track plays.
 //!
-//! An `icons.json` assigns icons by track number, with an optional
-//! `"default"` for every other track:
+//! An `icons.json` assigns icons by chapter number, with an optional
+//! `"default"` for every other chapter (one track per chapter unless the
+//! audio is grouped in subfolders, so usually the track number):
 //!
 //! ```json
 //! {"default": "yoto:#aUm9i3ex3qqAMYBv-i-O-pYMKuMJGICtR3Vhf289u2Q",
@@ -72,17 +73,17 @@ impl Icon {
     }
 }
 
-/// Icons for a playlist: per track number (1-based) plus a fallback.
+/// Icons for a playlist: per chapter number (1-based) plus a fallback.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IconMap {
     pub source: Option<PathBuf>,
     pub default: Option<Icon>,
-    pub tracks: BTreeMap<usize, Icon>,
+    pub chapters: BTreeMap<usize, Icon>,
 }
 
 impl IconMap {
     /// Load an `icons.json`; file values resolve relative to its folder.
-    pub fn load(path: &Path, track_count: usize) -> Result<IconMap> {
+    pub fn load(path: &Path, chapter_count: usize) -> Result<IconMap> {
         let text = fs::read_to_string(path)
             .map_err(|e| Error::invalid(format!("cannot read {}: {e}", path.display())))?;
         let value: Value = serde_json::from_str(&text)
@@ -110,20 +111,20 @@ impl IconMap {
                 map.default = Some(icon);
                 continue;
             }
-            let n: usize = key.parse().ok().filter(|n| (1..=track_count).contains(n)).ok_or_else(|| {
+            let n: usize = key.parse().ok().filter(|n| (1..=chapter_count).contains(n)).ok_or_else(|| {
                 Error::invalid(format!(
-                    "{}: key {key:?} must be \"default\" or a track number from 1 to {track_count}",
+                    "{}: key {key:?} must be \"default\" or a chapter number from 1 to {chapter_count}",
                     path.display()
                 ))
             })?;
-            map.tracks.insert(n, icon);
+            map.chapters.insert(n, icon);
         }
         Ok(map)
     }
 
-    /// The icon for track `number` (1-based), if any was chosen.
-    pub fn for_track(&self, number: usize) -> Option<&Icon> {
-        self.tracks.get(&number).or(self.default.as_ref())
+    /// The icon for chapter `number` (1-based), if any was chosen.
+    pub fn for_chapter(&self, number: usize) -> Option<&Icon> {
+        self.chapters.get(&number).or(self.default.as_ref())
     }
 }
 
@@ -297,10 +298,10 @@ mod tests {
         .unwrap();
         let map = IconMap::load(&path, 3).unwrap();
         assert_eq!(
-            map.for_track(1),
+            map.for_chapter(1),
             Some(&Icon::File(tmp.path().join("icons/1.png")))
         );
-        assert_eq!(map.for_track(3), Some(&Icon::Yoto(ID.into())));
+        assert_eq!(map.for_chapter(3), Some(&Icon::Yoto(ID.into())));
 
         for bad in [
             json!({"4": format!("yoto:#{ID}")}),
@@ -319,13 +320,13 @@ mod tests {
     }
 
     #[test]
-    fn no_default_leaves_unlisted_tracks_unset() {
+    fn no_default_leaves_unlisted_chapters_unset() {
         let map = IconMap {
-            tracks: [(2, Icon::Yoto(ID.into()))].into(),
+            chapters: [(2, Icon::Yoto(ID.into()))].into(),
             ..IconMap::default()
         };
-        assert_eq!(map.for_track(1), None);
-        assert!(map.for_track(2).is_some());
+        assert_eq!(map.for_chapter(1), None);
+        assert!(map.for_chapter(2).is_some());
     }
 
     #[test]

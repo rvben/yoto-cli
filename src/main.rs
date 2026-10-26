@@ -44,7 +44,7 @@ enum Command {
     /// Create a playlist from a folder of audio files or a manifest playlist.
     #[command(group(ArgGroup::new("source").required(true).args(["dir", "manifest"])))]
     Upload {
-        /// Folder whose MP3/M4A files become the tracks, in file-name order.
+        /// Folder of audio (MP3, M4A/AAC, WAV, FLAC, Ogg/Opus) in name order; each file is a chapter, each subfolder one chapter of its files.
         #[arg(value_name = "DIR")]
         dir: Option<PathBuf>,
         /// A prepared manifest.json; titles, order and cover come from it.
@@ -65,10 +65,10 @@ enum Command {
         /// Do not upload a cover.
         #[arg(long)]
         no_cover: bool,
-        /// icons.json assigning icons by track number (default: icons.json beside the audio or in the book folder).
+        /// icons.json assigning icons by chapter number (default: icons.json beside the audio or in the book folder).
         #[arg(long, value_name = "FILE", conflicts_with = "no_icons")]
         icons: Option<PathBuf>,
-        /// Icon for every track the icons.json does not name: an image file or yoto:#<mediaId>.
+        /// Icon for every chapter the icons.json does not name: an image file or yoto:#<mediaId>.
         #[arg(long, value_name = "ICON")]
         icon: Option<String>,
         /// Ignore any icons.json.
@@ -77,6 +77,8 @@ enum Command {
         /// Replace the content of this existing playlist instead of creating a new one.
         #[arg(long, value_name = "CARD_ID")]
         replace: Option<String>,
+        #[command(flatten)]
+        metadata: Box<MetadataArgs>,
         /// Check everything locally and print the plan; nothing is sent.
         #[arg(long)]
         dry_run: bool,
@@ -94,6 +96,46 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+/// The playlist details shown in the Yoto app.
+#[derive(clap::Args)]
+struct MetadataArgs {
+    /// Author ("" removes it).
+    #[arg(long, value_name = "NAME")]
+    author: Option<String>,
+    /// Narrator ("" removes it).
+    #[arg(long, value_name = "NAME")]
+    read_by: Option<String>,
+    /// Description ("" removes it).
+    #[arg(long, value_name = "TEXT")]
+    description: Option<String>,
+    /// Category.
+    #[arg(long, value_enum)]
+    category: Option<yoto_cli::metadata::Category>,
+    /// Youngest age the playlist is for, in years.
+    #[arg(long, value_name = "YEARS")]
+    min_age: Option<u8>,
+    /// Oldest age the playlist is for, in years.
+    #[arg(long, value_name = "YEARS")]
+    max_age: Option<u8>,
+    /// Language as a BCP 47 tag such as nl or en-GB ("" removes it).
+    #[arg(long, value_name = "TAG")]
+    language: Option<String>,
+}
+
+impl From<MetadataArgs> for yoto_cli::metadata::Metadata {
+    fn from(a: MetadataArgs) -> Self {
+        yoto_cli::metadata::Metadata {
+            author: a.author,
+            read_by: a.read_by,
+            description: a.description,
+            category: a.category,
+            min_age: a.min_age,
+            max_age: a.max_age,
+            language: a.language,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -255,6 +297,7 @@ fn dispatch(ctx: &Context, command: Command) -> yoto_cli::Result<yoto_cli::Outpu
             icon,
             no_icons,
             replace,
+            metadata,
             dry_run,
             yes,
             transcode_timeout,
@@ -283,6 +326,7 @@ fn dispatch(ctx: &Context, command: Command) -> yoto_cli::Result<yoto_cli::Outpu
                     icon,
                     no_icons,
                     replace,
+                    metadata: (*metadata).into(),
                     dry_run,
                     yes,
                     transcode_timeout: Duration::from_secs(transcode_timeout),
@@ -324,4 +368,59 @@ fn emit_error(err: &Error) {
         error.insert("hint".into(), json!(hint));
     }
     eprintln!("{}", json!({ "error": error }));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// Every leaf subcommand with its arguments as the schema names them:
+    /// `--long` for flags, the id for positionals.
+    fn clap_commands() -> BTreeSet<(String, BTreeSet<String>)> {
+        fn walk(cmd: &clap::Command, prefix: &str, out: &mut BTreeSet<(String, BTreeSet<String>)>) {
+            for sub in cmd.get_subcommands().filter(|s| s.get_name() != "help") {
+                let name = format!("{prefix}{}", sub.get_name()).trim().to_string();
+                if sub.has_subcommands() {
+                    walk(sub, &format!("{name} "), out);
+                    continue;
+                }
+                let args = sub
+                    .get_arguments()
+                    .filter(|a| !a.is_global_set() && a.get_id() != "help")
+                    .map(|a| match a.get_long() {
+                        Some(long) => format!("--{long}"),
+                        None => a.get_id().to_string(),
+                    })
+                    .collect();
+                out.insert((name, args));
+            }
+        }
+        let mut out = BTreeSet::new();
+        walk(&Cli::command(), "", &mut out);
+        out
+    }
+
+    #[test]
+    fn the_schema_lists_exactly_the_commands_and_arguments_clap_accepts() {
+        let contract = schema::contract();
+        let declared: BTreeSet<(String, BTreeSet<String>)> = contract["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let args = c["args"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|a| a["name"].as_str().unwrap().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (c["name"].as_str().unwrap().to_string(), args)
+            })
+            .collect();
+        assert_eq!(clap_commands(), declared);
+    }
 }
