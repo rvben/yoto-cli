@@ -1310,7 +1310,7 @@ fn edits_refuse_what_they_cannot_do_safely_without_saving() {
         .create();
     let none = server.mock("POST", "/content").expect(0).create();
 
-    let cases: [(&[&str], i32, &str); 5] = [
+    let cases: [(&[&str], i32, &str); 4] = [
         (&["content", "edit", "abc12", "--yes"], 3, "usage"),
         (
             &["content", "edit", "other", "--author", "x", "--yes"],
@@ -1321,11 +1321,6 @@ fn edits_refuse_what_they_cannot_do_safely_without_saving() {
             &["content", "chapter", "rename", "abc12", "1", "x", "--yes"],
             8,
             "api_error",
-        ),
-        (
-            &["content", "edit", "abc12", "--min-age", "120", "--yes"],
-            1,
-            "invalid_input",
         ),
         (
             &[
@@ -1624,6 +1619,28 @@ fn an_upload_checks_the_size_limit_on_the_transcoded_audio() {
         out.stderr
     );
     none.assert();
+}
+
+#[test]
+fn every_age_outside_0_to_99_is_the_same_usage_error() {
+    let server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    for flag in ["--min-age", "--max-age"] {
+        for age in ["100", "120", "255", "256", "1000", "-1", "two"] {
+            let out = env.run(&["content", "edit", "abc12", flag, age, "--yes"]);
+            assert_eq!(out.code, 3, "{flag} {age}: {}", out.stderr);
+            assert_eq!(out.error()["kind"], "usage", "{flag} {age}");
+        }
+        // 99 gets past the flags to the API, which this server does not answer.
+        let out = env.run(&["content", "edit", "abc12", flag, "99", "--dry-run"]);
+        assert_eq!(
+            out.error()["kind"],
+            "api_error",
+            "{flag} 99: {}",
+            out.stderr
+        );
+    }
 }
 
 #[test]

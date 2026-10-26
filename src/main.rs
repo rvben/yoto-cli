@@ -116,15 +116,21 @@ struct MetadataArgs {
     /// Category.
     #[arg(long, value_enum)]
     category: Option<yoto_cli::metadata::Category>,
-    /// Youngest age the playlist is for, in years.
-    #[arg(long, value_name = "YEARS")]
+    /// Youngest age the playlist is for, in years (0 to 99).
+    #[arg(long, value_name = "YEARS", value_parser = age_parser())]
     min_age: Option<u8>,
-    /// Oldest age the playlist is for, in years.
-    #[arg(long, value_name = "YEARS")]
+    /// Oldest age the playlist is for, in years (0 to 99).
+    #[arg(long, value_name = "YEARS", value_parser = age_parser())]
     max_age: Option<u8>,
     /// Language as a BCP 47 tag such as nl or en-GB ("" removes it).
     #[arg(long, value_name = "TAG")]
     language: Option<String>,
+}
+
+/// Ages are whole years from 0 to `MAX_AGE`; anything else is a usage error
+/// like any other flag value clap cannot accept.
+fn age_parser() -> clap::builder::RangedI64ValueParser<u8> {
+    clap::value_parser!(u8).range(..=i64::from(yoto_cli::metadata::MAX_AGE))
 }
 
 impl From<MetadataArgs> for yoto_cli::metadata::Metadata {
