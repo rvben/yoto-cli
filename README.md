@@ -48,10 +48,11 @@ refreshed automatically, also in the middle of a long upload;
 
 ## Upload a playlist
 
-Point `upload` at a folder of audio files: MP3, M4A/AAC, WAV, FLAC,
-Ogg (Opus or Vorbis) or AIFF, recognised by their content rather than their
-extension. Tracks are taken in file-name order and a numeric prefix such as
-`01 - ` is dropped from the title. Each subfolder becomes one chapter of the
+Point `upload` at a folder of audio files: MP3, M4A/AAC, WAV, FLAC or Ogg
+(Opus or Vorbis), recognised by their content rather than their extension.
+AIFF is refused up front, because Yoto cannot transcode it. Tracks are taken in
+file-name order, with numbers compared by value (`2` before `10`) and without
+regard to case, and a numeric prefix such as `01 - ` is dropped from the title. Each subfolder becomes one chapter of the
 audio in it; folders nested deeper are listed as ignored in the dry run. A
 `cover.jpg` or `cover.png` in the folder (or its parent) becomes the cover;
 `--cover FILE` picks another and `--no-cover` sends none. The title defaults to

@@ -128,11 +128,10 @@ impl IconMap {
     }
 }
 
-/// The first `icons.json` among `dirs`.
+/// The first `icons.json` among `dirs`, in any case.
 pub fn find(dirs: &[&Path]) -> Option<PathBuf> {
     dirs.iter()
-        .map(|d| d.join(ICONS_FILE))
-        .find(|p| p.is_file())
+        .find_map(|d| crate::plan::find_file(d, ICONS_FILE))
 }
 
 /// What the upload needs to know about an icon image.

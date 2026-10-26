@@ -354,8 +354,52 @@ fn default_title(dir: &Path) -> String {
 
 fn find_cover(dirs: &[&Path]) -> Option<PathBuf> {
     dirs.iter()
-        .flat_map(|d| COVER_NAMES.iter().map(move |n| d.join(n)))
-        .find(|p| p.is_file())
+        .flat_map(|d| COVER_NAMES.iter().map(move |n| (d, n)))
+        .find_map(|(d, n)| find_file(d, n))
+}
+
+/// The file in `dir` named `name` (lower case) in any case, so `Cover.JPG`
+/// is found on a case-sensitive file system too. The exact spelling wins
+/// when several match.
+pub fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .filter(|(n, p)| n.to_lowercase() == name && p.is_file())
+        .min_by(|(a, _), (b, _)| (a != name).cmp(&(b != name)).then_with(|| a.cmp(b)))
+        .map(|(_, p)| p)
+}
+
+/// Name order as people read it: runs of digits compare by value, so `2`
+/// comes before `10`, and letters compare without regard to case. Names
+/// that differ only in case or zero padding keep a fixed byte order.
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn chunks(s: &str) -> Vec<(bool, String)> {
+        let mut out: Vec<(bool, String)> = Vec::new();
+        for c in s.chars() {
+            let digit = c.is_ascii_digit();
+            match out.last_mut() {
+                Some((d, run)) if *d == digit => run.push(c),
+                _ => out.push((digit, c.to_string())),
+            }
+        }
+        out
+    }
+    let (ca, cb) = (chunks(a), chunks(b));
+    for ((da, ra), (db, rb)) in ca.iter().zip(&cb) {
+        let ord = match (da, db) {
+            (true, true) => {
+                let (ta, tb) = (ra.trim_start_matches('0'), rb.trim_start_matches('0'));
+                ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb))
+            }
+            _ => ra.to_lowercase().cmp(&rb.to_lowercase()),
+        };
+        if ord.is_ne() {
+            return ord;
+        }
+    }
+    ca.len().cmp(&cb.len()).then_with(|| a.cmp(b))
 }
 
 /// Which icons.json a plan takes its chapter icons from.
@@ -406,8 +450,8 @@ fn list_dir(dir: &Path) -> Result<(Vec<String>, Vec<String>)> {
             dirs.push(name);
         }
     }
-    files.sort();
-    dirs.sort();
+    files.sort_by(|a, b| natural_cmp(a, b));
+    dirs.sort_by(|a, b| natural_cmp(a, b));
     Ok((files, dirs))
 }
 
@@ -437,7 +481,7 @@ pub fn from_dir(dir: &Path, icons_file: IconsFile) -> Result<Plan> {
                 .map(|d| (d, true)),
         )
         .collect();
-    entries.sort();
+    entries.sort_by(|a, b| natural_cmp(a.0, b.0).then(a.1.cmp(&b.1)));
     let mut tracks = Vec::new();
     let mut chapters = Vec::new();
     let mut ignored = Vec::new();
@@ -468,7 +512,7 @@ pub fn from_dir(dir: &Path, icons_file: IconsFile) -> Result<Plan> {
             continue;
         }
         if !is_audio_name(name) {
-            let lower = name.to_ascii_lowercase();
+            let lower = name.to_lowercase();
             if !name.starts_with('.')
                 && !COVER_NAMES.contains(&lower.as_str())
                 && lower != icons::ICONS_FILE
@@ -836,6 +880,25 @@ mod tests {
     }
 
     #[test]
+    fn numbers_in_names_sort_by_value_and_case_does_not_split_the_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Boek");
+        write(&dir.join("10 - Tien.mp3"), MP3);
+        write(&dir.join("2 - Twee.mp3"), MP3);
+        write(&dir.join("1 - Een.mp3"), MP3);
+        write(&dir.join("B.mp3"), MP3);
+        write(&dir.join("a.mp3"), MP3);
+        write(&dir.join("3 - Drie/track 10.mp3"), MP3);
+        write(&dir.join("3 - Drie/track 9.mp3"), MP3);
+        let plan = from_dir(&dir, IconsFile::Detect).unwrap();
+        let titles: Vec<_> = plan.tracks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["Een", "Twee", "track 9", "track 10", "Tien", "a", "B"]
+        );
+    }
+
+    #[test]
     fn deeper_folders_are_reported_not_dropped() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("Boek");
@@ -845,6 +908,29 @@ mod tests {
         let plan = from_dir(&dir, IconsFile::Detect).unwrap();
         assert_eq!(plan.tracks.len(), 1);
         assert_eq!(plan.ignored, ["01 - Deel/CD2/"]);
+    }
+
+    #[test]
+    fn cover_and_icons_are_found_whatever_their_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Boek");
+        write(&dir.join("01.mp3"), MP3);
+        write(&dir.join("Cover.JPG"), b"\xff\xd8\xffxx");
+        let id = "7Wt--qhx9t7PCSC8WBmGKJvlG53Z1uk7bN1dE9wGWJ0";
+        write(
+            &dir.join("Icons.json"),
+            json!({"1": format!("yoto:#{id}")}).to_string().as_bytes(),
+        );
+        let plan = from_dir(&dir, IconsFile::Detect).unwrap();
+        assert_eq!(
+            plan.cover.as_deref().map(|p| p.file_name().unwrap()),
+            Some("Cover.JPG".as_ref())
+        );
+        assert_eq!(
+            plan.icons.for_chapter(1),
+            Some(&icons::Icon::Yoto(id.into()))
+        );
+        assert!(plan.ignored.is_empty(), "{:?}", plan.ignored);
     }
 
     #[test]
