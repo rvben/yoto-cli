@@ -93,6 +93,11 @@ fn format_mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1e6)
 }
 
+/// `n` and the noun, plural unless `n` is 1: "1 track", "2 tracks".
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
 pub struct LoginOptions {
     pub client_id: Option<String>,
     pub port: u16,
@@ -560,8 +565,8 @@ pub fn content_append(
     if total > plan::MAX_TRACKS {
         return Err(Error::LimitExceeded {
             message: format!(
-                "the playlist has {} tracks; adding {} makes {total}, above Yoto's limit of {}",
-                edit::track_count(&before),
+                "the playlist has {}; adding {} makes {total}, above Yoto's limit of {}",
+                count(edit::track_count(&before), "track"),
                 plan.tracks.len(),
                 plan::MAX_TRACKS
             ),
@@ -580,11 +585,9 @@ pub fn content_append(
     }
     let existing = edit::chapter_count(&before);
     let what = format!(
-        "append {} chapter{} ({} track{}, {})",
-        plan.chapters.len(),
-        if plan.chapters.len() == 1 { "" } else { "s" },
-        plan.tracks.len(),
-        if plan.tracks.len() == 1 { "" } else { "s" },
+        "append {} ({}, {})",
+        count(plan.chapters.len(), "chapter"),
+        count(plan.tracks.len(), "track"),
         format_mb(plan.total_bytes())
     );
     if opts.confirm.dry_run {
@@ -853,12 +856,12 @@ pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) 
     let chapters = if plan.chapters.len() == plan.tracks.len() {
         String::new()
     } else {
-        format!(" in {} chapters", plan.chapters.len())
+        format!(" in {}", count(plan.chapters.len(), "chapter"))
     };
     let summary = format!(
-        "{:?}: {} tracks{chapters}, {}{}",
+        "{:?}: {}{chapters}, {}{}",
         plan.title,
-        plan.tracks.len(),
+        count(plan.tracks.len(), "track"),
         format_mb(plan.total_bytes()),
         plan.total_seconds()
             .map(|s| format!(", {}", format_duration(s)))
@@ -957,7 +960,7 @@ pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) 
         &mut log,
     )?;
     let text = format!(
-        "{} {:?} ({}): {} tracks{chapters} ({} uploaded, {} already on Yoto){}.\n{}",
+        "{} {:?} ({}): {}{chapters} ({} uploaded, {} already on Yoto){}.\n{}",
         if opts.replace.is_some() {
             "Replaced"
         } else {
@@ -965,7 +968,7 @@ pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) 
         },
         plan.title,
         result["card_id"].as_str().unwrap_or("?"),
-        result["track_count"],
+        count(plan.tracks.len(), "track"),
         result["uploaded"],
         result["reused"],
         result["duration_seconds"]

@@ -1837,6 +1837,66 @@ fn people_are_saved_as_the_lists_yoto_keeps() {
 }
 
 #[test]
+fn upload_counts_read_as_words_in_the_singular_too() {
+    let env = Env::new("http://127.0.0.1:9");
+    let one = env.tmp.path().join("Een");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::write(one.join("01 - a.mp3"), b"ID3\x04\x00 one").unwrap();
+    let out = env.run(&["upload", "--dry-run", one.to_str().unwrap(), "-o", "text"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("\"Een\": 1 track, "), "{}", out.stdout);
+
+    let joined = env.tmp.path().join("Samen");
+    std::fs::create_dir_all(joined.join("Deel")).unwrap();
+    for name in ["01 - a.mp3", "02 - b.mp3"] {
+        std::fs::write(joined.join("Deel").join(name), b"ID3\x04\x00 part").unwrap();
+    }
+    let out = env.run(&[
+        "upload",
+        "--dry-run",
+        joined.to_str().unwrap(),
+        "-o",
+        "text",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stdout.contains("\"Samen\": 2 tracks in 1 chapter, "),
+        "{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn the_append_track_limit_counts_one_track_in_the_singular() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let mut card = stored_card();
+    card["content"]["chapters"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(1);
+    let _stored = mock_stored(&mut server, &card);
+    let dir = env.tmp.path().join("Honderd");
+    std::fs::create_dir_all(&dir).unwrap();
+    for n in 1..=100 {
+        std::fs::write(dir.join(format!("{n:03}.mp3")), b"ID3\x04\x00 track").unwrap();
+    }
+    let out = env.run(&[
+        "content",
+        "append",
+        "abc12",
+        dir.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(out.code, 6, "{}", out.stderr);
+    assert_eq!(
+        out.error()["message"],
+        "the playlist has 1 track; adding 100 makes 101, above Yoto's limit of 100"
+    );
+}
+
+#[test]
 fn several_authors_and_narrators_are_kept_in_order() {
     let mut server = Server::new();
     let env = Env::new(&server.url());
