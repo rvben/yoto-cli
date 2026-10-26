@@ -980,9 +980,11 @@ mod tests {
     #[test]
     fn non_audio_with_audio_extension_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        write(&tmp.path().join("01 - a.mp3"), b"OggS\x00\x02....");
-        let err = from_dir(tmp.path(), IconsFile::Detect).unwrap_err();
+        let dir = tmp.path().join("Kaart");
+        write(&dir.join("01 - a.mp3"), b"not audio at all");
+        let err = from_dir(&dir, IconsFile::Ignore).unwrap_err();
         assert_eq!(err.kind(), "invalid_input");
+        assert!(err.to_string().contains("is not MP3"), "{err}");
     }
 
     fn track(bytes: u64, secs: Option<f64>) -> PlannedTrack {
