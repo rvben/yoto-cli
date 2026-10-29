@@ -1954,3 +1954,176 @@ fn several_authors_and_narrators_are_kept_in_order() {
     }
     none.assert();
 }
+
+#[test]
+fn concurrent_upload_finishes_later_track_first_but_saves_original_order() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let dir = book(env.tmp.path());
+    let first_sha = sha256_hex(&dir.join("01 - Het begin.mp3"));
+    let second_sha = sha256_hex(&dir.join("02 - Het einde.mp3"));
+    for (sha, n) in [(&first_sha, 1), (&second_sha, 2)] {
+        server
+            .mock("GET", "/media/transcode/audio/uploadUrl")
+            .match_query(Matcher::UrlEncoded("sha256".into(), sha.clone()))
+            .with_body(json!({"upload":{"uploadId":format!("up{n}")}}).to_string())
+            .expect(1)
+            .create();
+    }
+    let second_ready = Arc::new(AtomicBool::new(false));
+    let flag = second_ready.clone();
+    let first = server.mock("GET", "/media/upload/up1/transcoded")
+        .match_query(Matcher::Any)
+        .with_body_from_request(move |_| {
+            if !flag.load(Ordering::SeqCst) { return b"{}".to_vec(); }
+            json!({"transcode":{"transcodedSha256":"t1","transcodedInfo":{"duration":60,"fileSize":1000,"format":"aac"}}}).to_string().into()
+        }).expect_at_least(1).create();
+    let flag = second_ready.clone();
+    let second = server.mock("GET", "/media/upload/up2/transcoded")
+        .match_query(Matcher::Any)
+        .with_body_from_request(move |_| {
+            flag.store(true, Ordering::SeqCst);
+            json!({"transcode":{"transcodedSha256":"t2","transcodedInfo":{"duration":120,"fileSize":2000,"format":"aac"}}}).to_string().into()
+        }).expect(1).create();
+    let (create, seen) = mock_create(&mut server, json!({"title":"Boek"}), "parallel");
+    // Without concurrent workers, track 1 can never finish: track 2 releases it.
+    let out = env.run(&[
+        "upload",
+        "--yes",
+        "--no-cover",
+        "--no-icons",
+        "--transcode-timeout",
+        "5",
+        dir.to_str().unwrap(),
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["reused"], 2);
+    let bodies = seen.lock().unwrap();
+    assert_eq!(
+        bodies[0]["content"]["chapters"][0]["tracks"][0]["trackUrl"],
+        "yoto:#t1"
+    );
+    assert_eq!(
+        bodies[0]["content"]["chapters"][1]["tracks"][0]["trackUrl"],
+        "yoto:#t2"
+    );
+    assert!(out.stderr.contains("waiting for transcode"));
+    assert!(out.stderr.contains("ready:"));
+    first.assert();
+    second.assert();
+    create.assert();
+}
+
+#[test]
+fn upload_concurrency_range_is_checked_before_sign_in_or_network() {
+    let env = Env::new("http://127.0.0.1:1");
+    for command in [vec!["upload"], vec!["content", "append", "card"]] {
+        for invalid in ["0", "9", "-1", "bogus"] {
+            let mut args = command.clone();
+            args.extend([".", "--concurrency", invalid, "--yes"]);
+            let out = env.run(&args);
+            assert_eq!(out.error()["kind"], "usage", "{}", out.stderr);
+        }
+    }
+}
+
+#[test]
+fn failed_parallel_transcode_never_saves_a_playlist() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("tok", far_future(), None);
+    let dir = book(env.tmp.path());
+    for (file, n) in [("01 - Het begin.mp3", 1), ("02 - Het einde.mp3", 2)] {
+        server
+            .mock("GET", "/media/transcode/audio/uploadUrl")
+            .match_query(Matcher::UrlEncoded(
+                "sha256".into(),
+                sha256_hex(&dir.join(file)),
+            ))
+            .with_body(json!({"upload":{"uploadId":format!("up{n}")}}).to_string())
+            .create();
+        server
+            .mock("GET", format!("/media/upload/up{n}/transcoded").as_str())
+            .match_query(Matcher::Any)
+            .with_body(if n == 1 {
+                json!({"transcode":{"error":"bad audio","uploadFilename":file}}).to_string()
+            } else {
+                "{}".into()
+            })
+            .create();
+    }
+    let save = server.mock("POST", "/content").expect(0).create();
+    let out = env.run(&[
+        "upload",
+        "--yes",
+        "--no-cover",
+        "--no-icons",
+        "--concurrency",
+        "2",
+        dir.to_str().unwrap(),
+    ]);
+    assert_eq!(out.error()["kind"], "transcode_failed", "{}", out.stderr);
+    assert!(out.stderr.contains("playlist not saved"));
+    assert!(out.stdout.is_empty());
+    save.assert();
+}
+
+#[test]
+fn parallel_workers_rejected_together_rotate_the_refresh_token_once() {
+    let mut server = Server::new();
+    let env = Env::new(&server.url());
+    env.sign_in("old", far_future(), Some("refresh-1"));
+    let dir = book(env.tmp.path());
+    // Both clients fork the old token before either worker starts. Each must
+    // recover from a 401; the refresh token itself may only be used once.
+    let (rotation, _) = mock_slow_rotation(&mut server);
+    let rejected = server
+        .mock("GET", "/media/transcode/audio/uploadUrl")
+        .match_query(Matcher::Any)
+        .match_header("authorization", "Bearer old")
+        .with_status(401)
+        .with_body(r#"{"error":{"message":"jwt expired"}}"#)
+        .expect(2)
+        .create();
+    let mut tracks = Vec::new();
+    for (file, n) in [("01 - Het begin.mp3", 1), ("02 - Het einde.mp3", 2)] {
+        tracks.push(
+            server
+                .mock("GET", "/media/transcode/audio/uploadUrl")
+                .match_query(Matcher::UrlEncoded(
+                    "sha256".into(),
+                    sha256_hex(&dir.join(file)),
+                ))
+                .match_header("authorization", "Bearer new")
+                .with_body(json!({"upload":{"uploadId":format!("up{n}")}}).to_string())
+                .expect(1)
+                .create(),
+        );
+        tracks.push(server.mock("GET", format!("/media/upload/up{n}/transcoded").as_str())
+            .match_query(Matcher::Any).match_header("authorization", "Bearer new")
+            .with_body(json!({"transcode":{"transcodedSha256":format!("t{n}"),"transcodedInfo":{"duration":60,"fileSize":1000,"format":"aac"}}}).to_string())
+            .expect(1).create());
+    }
+    let (create, _) = mock_create(&mut server, json!({"title":"Boek"}), "rotated");
+    let out = env.run(&[
+        "upload",
+        "--yes",
+        "--no-cover",
+        "--no-icons",
+        "--concurrency",
+        "2",
+        dir.to_str().unwrap(),
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json()["card_id"], "rotated");
+    rejected.assert();
+    rotation.assert();
+    create.assert();
+    for mock in &tracks {
+        mock.assert();
+    }
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(env.token_file()).unwrap()).unwrap();
+    assert_eq!(saved["refresh_token"], "refresh-2");
+}

@@ -2,7 +2,9 @@
 //! already has), bounded wait for transcoding, then one `POST /content`.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
@@ -17,6 +19,7 @@ pub const DEFAULT_ICON: &str = "yoto:#aUm9i3ex3qqAMYBv-i-O-pYMKuMJGICtR3Vhf289u2
 
 pub struct Options {
     pub transcode_timeout: Duration,
+    pub concurrency: usize,
     pub upload_cover: bool,
     /// Replace this existing playlist instead of creating a new one.
     pub replace: Option<String>,
@@ -49,6 +52,7 @@ pub fn run(
     opts: &Options,
     mut log: impl FnMut(String),
 ) -> Result<Value> {
+    validate_concurrency(opts.concurrency)?;
     let cover_url = match (&plan.cover, opts.upload_cover) {
         (Some(path), true) => {
             let bytes = std::fs::read(path).map_err(|e| {
@@ -64,7 +68,14 @@ pub fn run(
     };
 
     let icon_refs = upload_icons(client, plan, &mut log)?;
-    let done = upload_tracks(client, plan, hashes, opts.transcode_timeout, &mut log)?;
+    let done = upload_tracks(
+        client,
+        plan,
+        hashes,
+        opts.transcode_timeout,
+        opts.concurrency,
+        &mut log,
+    )?;
 
     let chapters: Vec<ChapterBody> = plan
         .chapters
@@ -113,29 +124,40 @@ pub fn run(
     }))
 }
 
-/// Upload (or find on Yoto) every track of `plan` and wait for each to be
-/// transcoded, in order.
+/// Upload and transcode a bounded number of tracks concurrently. Results are
+/// collected by source index, never completion order. On failure, stop issuing
+/// work, interrupt other transcode waits, and leave the playlist untouched.
 pub fn upload_tracks(
     client: &Client,
     plan: &Plan,
     hashes: &[String],
     transcode_timeout: Duration,
+    concurrency: usize,
     log: &mut impl FnMut(String),
 ) -> Result<Vec<Uploaded>> {
-    assert_eq!(hashes.len(), plan.tracks.len(), "one hash per track");
+    validate_concurrency(concurrency)?;
+    if hashes.len() != plan.tracks.len() {
+        return Err(Error::invalid("expected one SHA-256 hash per track"));
+    }
     let n = plan.tracks.len();
-    let mut done = Vec::with_capacity(n);
-    for (i, (track, sha)) in plan.tracks.iter().zip(hashes).enumerate() {
+    let workers = (0..concurrency.min(n)).map(|_| client.fork()).collect();
+    parallel_tracks(workers, n, log, |client, i, emit, cancelled| {
+        let track = &plan.tracks[i];
+        let started = Instant::now();
         let filename = track
             .path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let slot = client.upload_slot(sha, &filename)?;
+        emit(format!("[{}/{n}] checking Yoto: {}", i + 1, track.title));
+        let slot = client.upload_slot(&hashes[i], &filename)?;
         let reused = slot.upload_url.is_none();
+        if cancelled.load(Ordering::Acquire) {
+            return Err(stopped());
+        }
         match &slot.upload_url {
             Some(url) => {
-                log(format!(
+                emit(format!(
                     "[{}/{n}] uploading {} ({:.1} MB)",
                     i + 1,
                     track.title,
@@ -143,9 +165,15 @@ pub fn upload_tracks(
                 ));
                 client.put_audio(url, &track.path, track.format.content_type())?;
             }
-            None => log(format!("[{}/{n}] already on Yoto: {}", i + 1, track.title)),
+            None => emit(format!("[{}/{n}] already on Yoto: {}", i + 1, track.title)),
         }
-        let transcoded = client.wait_transcoded(&slot.upload_id, transcode_timeout)?;
+        emit(format!(
+            "[{}/{n}] waiting for transcode: {}",
+            i + 1,
+            track.title
+        ));
+        let transcoded =
+            client.wait_transcoded_cancellable(&slot.upload_id, transcode_timeout, cancelled)?;
         if let Some(d) = transcoded.duration.filter(|d| *d > plan::MAX_TRACK_SECONDS) {
             return Err(Error::LimitExceeded {
                 message: format!(
@@ -155,14 +183,131 @@ pub fn upload_tracks(
                 ),
             });
         }
-        done.push(Uploaded {
+        emit(format!(
+            "[{}/{n}] ready: {} ({:.1}s)",
+            i + 1,
+            track.title,
+            started.elapsed().as_secs_f64()
+        ));
+        Ok(Uploaded {
             title: track.title.clone(),
             transcoded,
             reused,
             on_end: track.on_end,
+        })
+    })
+}
+
+pub fn validate_concurrency(concurrency: usize) -> Result<()> {
+    if !(1..=8).contains(&concurrency) {
+        return Err(Error::Usage {
+            message: "--concurrency must be between 1 and 8".into(),
         });
     }
-    Ok(done)
+    Ok(())
+}
+
+fn stopped() -> Error {
+    Error::Network {
+        message: "upload stopped after another track failed".into(),
+    }
+}
+
+/// Only the coordinator schedules work and calls the user's logger. Workers
+/// own their clients, keeping each transcode deadline independent.
+fn parallel_tracks<W: Send, T: Send>(
+    workers: Vec<W>,
+    count: usize,
+    log: &mut impl FnMut(String),
+    work: impl Fn(&mut W, usize, &dyn Fn(String), &AtomicBool) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    enum Event<T> {
+        Progress(String),
+        Finished(usize, usize, Result<T>),
+    }
+    let cancelled = AtomicBool::new(false);
+    let started = Instant::now();
+    let worker_count = workers.len();
+    let mut done: Vec<Option<T>> = (0..count).map(|_| None).collect();
+    let mut error = None;
+    log(format!(
+        "processing {count} tracks with {worker_count} worker(s)"
+    ));
+    std::thread::scope(|scope| {
+        let (events, incoming) = mpsc::channel();
+        let mut jobs = Vec::new();
+        for (worker_id, mut worker) in workers.into_iter().enumerate() {
+            let (send_job, receive_job) = mpsc::channel();
+            jobs.push(send_job);
+            let events = events.clone();
+            let work = &work;
+            let cancelled = &cancelled;
+            scope.spawn(move || {
+                for index in receive_job {
+                    let emit = |line| { let _ = events.send(Event::Progress(line)); };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        work(&mut worker, index, &emit, cancelled)
+                    })).unwrap_or_else(|_| Err(Error::Network {
+                        message: "upload worker stopped unexpectedly; retry to reuse completed uploads".into(),
+                    }));
+                    if events.send(Event::Finished(worker_id, index, result)).is_err() { break; }
+                }
+            });
+        }
+        drop(events);
+        let mut next = worker_count;
+        let mut active = worker_count;
+        let mut completed = 0;
+        for (i, sender) in jobs.iter().enumerate() {
+            sender.send(i).expect("worker is waiting for its first job");
+        }
+        while active > 0 {
+            match incoming.recv_timeout(Duration::from_secs(10)) {
+                Ok(Event::Progress(line)) => log(line),
+                Ok(Event::Finished(worker_id, index, result)) => {
+                    active -= 1;
+                    match result {
+                        Ok(track) => {
+                            done[index] = Some(track);
+                            completed += 1;
+                        }
+                        Err(e) if error.is_none() => {
+                            log(format!(
+                                "[{}/{}] failed; stopping new tracks (playlist not saved)",
+                                index + 1,
+                                count
+                            ));
+                            error = Some(e);
+                            cancelled.store(true, Ordering::Release);
+                        }
+                        Err(_) => {}
+                    }
+                    if error.is_none() && next < count {
+                        jobs[worker_id]
+                            .send(next)
+                            .expect("worker is waiting for its next job");
+                        next += 1;
+                        active += 1;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => log(format!(
+                    "{completed}/{count} tracks ready; {active} in progress ({:.0}s elapsed)",
+                    started.elapsed().as_secs_f64()
+                )),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    unreachable!("workers report each result")
+                }
+            }
+        }
+        drop(jobs);
+    });
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(done
+        .into_iter()
+        .map(|t| t.expect("every track completed"))
+        .collect())
 }
 
 /// Resolve every chapter's icon to a `yoto:#` reference, uploading each
@@ -302,6 +447,119 @@ pub fn content_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parallel_workers_overlap_but_results_keep_source_order() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Barrier, Mutex};
+        let barrier = Barrier::new(2);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        let mut events = Vec::new();
+        let results = parallel_tracks(
+            vec![(), ()],
+            4,
+            &mut |line| {
+                if line == "second finished" {
+                    release.send(()).unwrap();
+                }
+                events.push(line);
+            },
+            |_, i, emit, _| {
+                let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                if i < 2 {
+                    barrier.wait();
+                }
+                if i == 0 {
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                if i == 1 {
+                    emit("second finished".into());
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(i)
+            },
+        )
+        .unwrap();
+        assert_eq!(results, [0, 1, 2, 3]);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert!(events.iter().any(|line| line == "second finished"));
+    }
+
+    #[test]
+    fn serial_mode_never_overlaps_or_reorders_work() {
+        use std::sync::atomic::AtomicUsize;
+        let next = AtomicUsize::new(0);
+        let result = parallel_tracks(vec![()], 7, &mut |_| {}, |_, i, _, _| {
+            assert_eq!(next.fetch_add(1, Ordering::SeqCst), i);
+            Ok(i)
+        })
+        .unwrap();
+        assert_eq!(result, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn failure_cancels_waiting_worker_and_does_not_schedule_more_tracks() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+        let entered = AtomicUsize::new(0);
+        let barrier = Barrier::new(2);
+        let err = parallel_tracks(
+            vec![(), ()],
+            10,
+            &mut |_| {},
+            |_, i, _, cancelled| -> Result<usize> {
+                entered.fetch_add(1, Ordering::SeqCst);
+                barrier.wait();
+                if i == 0 {
+                    return Err(Error::invalid("bad audio"));
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cancelled.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "coordinator did not cancel its workers"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(stopped())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::invalid("bad audio"));
+        assert_eq!(entered.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn worker_panic_does_not_hang_the_coordinator() {
+        let err = parallel_tracks(vec![()], 2, &mut |_| {}, |_, _, _, _| -> Result<()> {
+            panic!("simulated worker failure")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("worker stopped unexpectedly"));
+    }
+
+    #[test]
+    fn concurrency_must_be_bounded_even_for_library_callers() {
+        for n in [0, 9, usize::MAX] {
+            assert_eq!(validate_concurrency(n).unwrap_err().kind(), "usage");
+        }
+        for n in 1..=8 {
+            validate_concurrency(n).unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_playlist_starts_no_workers() {
+        let result =
+            parallel_tracks::<(), ()>(vec![], 0, &mut |_| {}, |_, _, _, _| panic!("no work"));
+        assert!(result.unwrap().is_empty());
+    }
 
     fn uploaded(title: &str, sha: &str, duration: Option<f64>) -> Uploaded {
         Uploaded {

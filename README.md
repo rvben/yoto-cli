@@ -68,6 +68,18 @@ and 60 minutes per track, and 500 MB per playlist. Yoto keeps files by SHA-256,
 so a file it already has is not uploaded again and an interrupted run can
 simply be repeated.
 
+Uploads and transcodes run with three tracks in flight by default. Adjust
+with `--concurrency N` (1–8); use `--concurrency 1` for serial uploads on a
+slow connection. This also works with `content append`. Playback order stays
+the same even when later tracks finish first. Progress on stderr names each
+track's stage and reports the number ready every ten seconds while waiting;
+stdout remains the final machine-readable result.
+
+If a track fails, no new tracks are scheduled, other transcode waits stop,
+and the playlist is not saved. Transfers already in flight may finish before
+the command exits. Retry the same command to reuse files Yoto already has.
+`--transcode-timeout` applies separately to each track after its upload.
+
 Each file becomes its own chapter, so the skip buttons on the player move
 between them. A subfolder becomes one chapter of the files in it, played in
 order, which suits a song in parts or a story split into several files:

@@ -12,6 +12,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
@@ -28,7 +30,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Where a signed-in client gets access tokens.
-pub trait Credentials {
+pub trait Credentials: Send + Sync {
     /// Tokens valid for at least the safety margin, refreshed when needed.
     /// Gives up once `deadline` passes.
     fn current(&self, deadline: Option<Instant>) -> Result<Tokens>;
@@ -73,7 +75,7 @@ pub struct Client {
     base: String,
     tokens: RefCell<Tokens>,
     /// `None` for a fixed token that is never renewed.
-    credentials: Option<Box<dyn Credentials>>,
+    credentials: Option<Arc<dyn Credentials>>,
     /// While set, renewing the sign-in gives up at this instant: a poll
     /// bounded by a deadline must not be held past it by the renewal.
     deadline: Cell<Option<Instant>>,
@@ -116,14 +118,19 @@ impl Client {
     /// they run out.
     pub fn signed_in(http: Http, base: &str, credentials: Box<dyn Credentials>) -> Result<Self> {
         let tokens = credentials.current(None)?;
-        Ok(Client::build(http, base, tokens, Some(credentials)))
+        Ok(Client::build(
+            http,
+            base,
+            tokens,
+            Some(Arc::from(credentials)),
+        ))
     }
 
     fn build(
         http: Http,
         base: &str,
         tokens: Tokens,
-        credentials: Option<Box<dyn Credentials>>,
+        credentials: Option<Arc<dyn Credentials>>,
     ) -> Self {
         Client {
             http,
@@ -133,6 +140,20 @@ impl Client {
             deadline: Cell::new(None),
             poll_interval: Duration::from_secs(2),
             retry_base: Duration::from_secs(1),
+        }
+    }
+
+    /// Independent token snapshot and transcode deadline, sharing the HTTP pool
+    /// and credential store. The store serializes refresh-token rotation.
+    pub fn fork(&self) -> Self {
+        Self {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            tokens: RefCell::new(self.tokens.borrow().clone()),
+            credentials: self.credentials.clone(),
+            deadline: Cell::new(None),
+            poll_interval: self.poll_interval,
+            retry_base: self.retry_base,
         }
     }
 
@@ -328,9 +349,18 @@ impl Client {
     /// request and each wait is cut to the time left, so the deadline holds
     /// however slow the API is.
     pub fn wait_transcoded(&self, upload_id: &str, timeout: Duration) -> Result<Transcoded> {
+        self.wait_transcoded_cancellable(upload_id, timeout, &AtomicBool::new(false))
+    }
+
+    pub(crate) fn wait_transcoded_cancellable(
+        &self,
+        upload_id: &str,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Transcoded> {
         let deadline = Instant::now() + timeout;
         self.deadline.set(Some(deadline));
-        let result = self.poll_transcoded(upload_id, timeout, deadline);
+        let result = self.poll_transcoded(upload_id, timeout, deadline, cancelled);
         self.deadline.set(None);
         result
     }
@@ -340,10 +370,16 @@ impl Client {
         upload_id: &str,
         timeout: Duration,
         deadline: Instant,
+        cancelled: &AtomicBool,
     ) -> Result<Transcoded> {
         let path = format!("/media/upload/{}/transcoded", encode_segment(upload_id));
         let mut last_failure: Option<String> = None;
         loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(Error::Network {
+                    message: "upload stopped after another track failed".into(),
+                });
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 let detail = last_failure
@@ -408,7 +444,14 @@ impl Client {
                 }
                 Err(e) => last_failure = Some(transport(e)?),
             }
-            std::thread::sleep(wait.min(deadline.saturating_duration_since(Instant::now())));
+            let wake =
+                Instant::now() + wait.min(deadline.saturating_duration_since(Instant::now()));
+            while !cancelled.load(Ordering::Acquire) && Instant::now() < wake {
+                std::thread::sleep(
+                    wake.saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(100)),
+                );
+            }
         }
     }
 
@@ -688,13 +731,12 @@ mod tests {
 
     /// Hands out `old` (about to expire) first and `new` on every later call.
     struct Expiring {
-        calls: std::cell::Cell<u32>,
+        calls: std::sync::atomic::AtomicU32,
     }
 
     impl Credentials for Expiring {
         fn current(&self, _: Option<Instant>) -> Result<Tokens> {
-            let n = self.calls.get();
-            self.calls.set(n + 1);
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
             let (token, expires_at) = if n == 0 {
                 ("old", now_unix() + 5)
             } else {
@@ -724,7 +766,7 @@ mod tests {
             .expect(1)
             .create();
         let credentials = Box::new(Expiring {
-            calls: std::cell::Cell::new(0),
+            calls: std::sync::atomic::AtomicU32::new(0),
         });
         let client = Client::signed_in(http_client(), &server.url(), credentials).unwrap();
         assert_eq!(client.list_mine().unwrap(), Vec::<Value>::new());

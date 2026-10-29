@@ -533,6 +533,7 @@ pub struct AppendOptions<'a> {
     pub no_icons: bool,
     pub confirm: Confirm,
     pub transcode_timeout: Duration,
+    pub concurrency: usize,
 }
 
 /// `content append`: add a folder's audio as new chapters at the end of a
@@ -543,6 +544,7 @@ pub fn content_append(
     opts: &AppendOptions,
     mut log: impl FnMut(String),
 ) -> Result<Output> {
+    upload::validate_concurrency(opts.concurrency)?;
     // Only an icons.json in the appended folder itself numbers the appended
     // chapters; one in the book folder numbers the book's own chapters.
     let detected = icons::find(&[opts.dir]);
@@ -647,7 +649,14 @@ pub fn content_append(
         log(format!("[{}/{n}] checking {}", i + 1, t.title))
     })?;
     let icon_refs = upload::upload_icons(&client, &plan, &mut log)?;
-    let done = upload::upload_tracks(&client, &plan, &hashes, opts.transcode_timeout, &mut log)?;
+    let done = upload::upload_tracks(
+        &client,
+        &plan,
+        &hashes,
+        opts.transcode_timeout,
+        opts.concurrency,
+        &mut log,
+    )?;
     let bodies: Vec<upload::ChapterBody> = plan
         .chapters
         .iter()
@@ -799,10 +808,12 @@ pub struct UploadOptions<'a> {
     pub dry_run: bool,
     pub yes: bool,
     pub transcode_timeout: Duration,
+    pub concurrency: usize,
 }
 
 /// Build the plan and apply the command-line overrides.
 pub fn build_plan(opts: &UploadOptions) -> Result<plan::Plan> {
+    upload::validate_concurrency(opts.concurrency)?;
     let icons_file = match (&opts.icons, opts.no_icons) {
         (_, true) => plan::IconsFile::Ignore,
         (Some(path), false) => plan::IconsFile::Path(path),
@@ -953,6 +964,7 @@ pub fn upload(ctx: &Context, opts: &UploadOptions, mut log: impl FnMut(String)) 
         &hashes,
         &upload::Options {
             transcode_timeout: opts.transcode_timeout,
+            concurrency: opts.concurrency,
             upload_cover: plan.cover.is_some(),
             replace: opts.replace.clone(),
             metadata: opts.metadata.clone(),

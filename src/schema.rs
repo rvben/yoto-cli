@@ -226,6 +226,7 @@ pub fn contract() -> Value {
                     {"name": "--no-icons", "type": "boolean", "default": false, "description": "Ignore any icons.json."},
                     {"name": "--dry-run", "type": "boolean", "default": false, "description": "Show the new chapters without uploading."},
                     {"name": "--yes", "type": "boolean", "default": false, "description": "Confirm the change."},
+                    {"name": "--concurrency", "type": "integer", "default": 3, "description": "Tracks uploading or transcoding at once, from 1 to 8. Use 1 for serial uploads. Playback order is preserved."},
                     {"name": "--transcode-timeout", "type": "integer", "default": 600, "description": "Seconds to wait for Yoto to transcode each track."}
                 ],
                 "output_fields": with_fields(edit_output_fields(), json!([
@@ -331,6 +332,7 @@ pub fn contract() -> Value {
                     {"name": "--replace", "type": "string", "description": "Card ID of your playlist to replace instead of creating a new one."},
                     {"name": "--dry-run", "type": "boolean", "default": false, "description": "Check files, hashes and limits and print the plan; no sign-in or network needed."},
                     {"name": "--yes", "type": "boolean", "default": false, "description": "Confirm creating the playlist."},
+                    {"name": "--concurrency", "type": "integer", "default": 3, "description": "Tracks uploading or transcoding at once, from 1 to 8. Use 1 for serial uploads. Playback order is preserved."},
                     {"name": "--transcode-timeout", "type": "integer", "default": 600, "description": "Seconds to wait for each track's transcode."}
                 ])),
                 "output_fields": [

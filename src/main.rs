@@ -91,6 +91,9 @@ enum Command {
         /// Seconds to wait for Yoto to transcode each track.
         #[arg(long, default_value_t = 600, value_name = "SECONDS")]
         transcode_timeout: u64,
+        /// Tracks uploading or transcoding at once (1–8); 1 runs serially.
+        #[arg(long, default_value_t = 3, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=8))]
+        concurrency: u8,
     },
     /// Print the machine-readable contract (clispec.dev) as JSON.
     Schema,
@@ -223,6 +226,9 @@ enum ContentCommand {
         /// Seconds to wait for Yoto to transcode each track.
         #[arg(long, default_value_t = 600, value_name = "SECONDS")]
         transcode_timeout: u64,
+        /// Tracks uploading or transcoding at once (1–8); 1 runs serially.
+        #[arg(long, default_value_t = 3, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=8))]
+        concurrency: u8,
     },
     /// Rename, delete, move or re-icon chapters of a playlist.
     #[command(subcommand)]
@@ -421,6 +427,7 @@ fn dispatch(ctx: &Context, command: Command) -> yoto_cli::Result<yoto_cli::Outpu
             no_icons,
             confirm,
             transcode_timeout,
+            concurrency,
         }) => yoto_cli::content_append(
             ctx,
             &card_id,
@@ -431,6 +438,7 @@ fn dispatch(ctx: &Context, command: Command) -> yoto_cli::Result<yoto_cli::Outpu
                 no_icons,
                 confirm: confirm.into(),
                 transcode_timeout: Duration::from_secs(transcode_timeout),
+                concurrency: usize::from(concurrency),
             },
             progress,
         ),
@@ -506,6 +514,7 @@ fn dispatch(ctx: &Context, command: Command) -> yoto_cli::Result<yoto_cli::Outpu
             dry_run,
             yes,
             transcode_timeout,
+            concurrency,
         } => {
             let source = match (&dir, &manifest, &book) {
                 (Some(d), None, _) => Source::Dir(d),
@@ -535,6 +544,7 @@ fn dispatch(ctx: &Context, command: Command) -> yoto_cli::Result<yoto_cli::Outpu
                     dry_run,
                     yes,
                     transcode_timeout: Duration::from_secs(transcode_timeout),
+                    concurrency: usize::from(concurrency),
                 },
                 progress,
             )
